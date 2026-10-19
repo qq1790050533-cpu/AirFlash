@@ -42,6 +42,8 @@ struct Running {
     pending_pin: Option<std::sync::mpsc::Sender<String>>,
     gain_limit: f64,
     volume: airflash_engine::volume::Control,
+    /// Device addresses of this session, used to validate targeted volume writes.
+    hosts: Vec<String>,
     equalizer: Option<(airflash_engine::equalizer::Control, u32)>,
     monitor_delay: Delay,
 }
@@ -151,6 +153,7 @@ fn main() {
                 let worker_gain = gain.clone();
                 let volume = airflash_engine::volume::Control::default();
                 let worker_volume = volume.clone();
+                let hosts = options.peers.iter().map(|p| p.host.to_string()).collect::<Vec<_>>();
                 let gain_limit = if request.command == "probe" { 0.1 } else { 1.0 };
                 let rate = options.sample_rate;
                 let equalizer = airflash_engine::equalizer::Control::new(options.equalizer, rate).unwrap();
@@ -174,6 +177,7 @@ fn main() {
                     pending_pin: None,
                     gain_limit,
                     volume,
+                    hosts,
                     equalizer: live_equalizer,
                     monitor_delay,
                 });
@@ -183,7 +187,13 @@ fn main() {
                     if let (Some(percent), Some(sequence)) = (
                         request.params.get("volume").and_then(Value::as_u64).filter(|v| *v <= 100),
                         request.params.get("sequence").and_then(Value::as_u64).filter(|v| *v > 0)) {
-                        r.volume.set(airflash_engine::volume::Command { sequence, percent: percent as u8 });
+                        // An absent or empty device target adjusts every device in the session.
+                        let host = request.params.get("host").and_then(Value::as_str).filter(|h| !h.is_empty());
+                        if host.is_some_and(|host| !r.hosts.iter().any(|h| h == host)) {
+                            send(&request.id, &request.session_id, json!({"event":"device_volume_error","message":"unknown device"}));
+                        } else {
+                            r.volume.set(airflash_engine::volume::Command { sequence, percent: percent as u8, host: host.map(str::to_string) });
+                        }
                     } else {
                         send(&request.id, &request.session_id, json!({"event":"device_volume_error","message":"invalid device volume command"}));
                     }
@@ -325,6 +335,7 @@ fn main() {
                     pending_pin: Some(tx),
                     gain_limit: 0.0,
                     volume: airflash_engine::volume::Control::default(),
+                    hosts: Vec::new(),
                     equalizer: None,
                     monitor_delay: Delay::default(),
                 });

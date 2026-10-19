@@ -118,6 +118,38 @@ internal static class UiSmoke
             Check(volumeRow.Volume == 44, "device unmute restores confirmed value", checks);
             app.MasterVolume = 25; await app.FlushVolumeAsync();
             Check(engine.Commands.Any(c => c.Text("command") == "set_gain" && c.GetProperty("params").Number("gain") == .25), "master gain reaches engine", checks);
+            // Per-device volume: a stereo session offers one slider per physical device.
+            Invoke(playbackButton); await Until(() => app.Snapshot.State == PlaybackState.Idle);
+            CheckPanelIcons(panel, app, checks);
+            var stereoRow = app.Receivers.Single(r => r.Receiver.Id == "b");
+            var stereoButton = Descendants(panel).OfType<Button>().Single(b => ReferenceEquals(b.Command, stereoRow.ToggleCommand));
+            Invoke(stereoButton); await Until(() => app.Snapshot.State == PlaybackState.Streaming && app.Snapshot.Receiver?.Id == "b");
+            CheckPanelIcons(panel, app, checks);
+            await Until(() => app.DeviceVolumes.Count == 2);
+            Check(app.DeviceVolumes.Select(d => d.Host).SequenceEqual(new[] { "127.0.0.2", "127.0.0.3" }), "each device of the session reports its own volume row", checks);
+            Check(!app.DeviceVolumesExpanded && app.HasPerDeviceVolumes, "the sub-entry stays closed until it is opened", checks);
+            var expandButton = Descendants(panel).OfType<Button>().Single(b => System.Windows.Automation.AutomationProperties.GetName(b) == L.Get("Per-device volume"));
+            Invoke(expandButton); await Pump();
+            Check(app.DeviceVolumesExpanded, "the sub-entry expands beside the master volume", checks);
+            var rightSlider = Descendants(panel).OfType<Slider>().Single(s => System.Windows.Automation.AutomationProperties.GetName(s) == "右侧");
+            Check(rightSlider.IsEnabled && app.DeviceVolumes[0].Volume == 28 && app.DeviceVolumes[1].Volume == 28, "each device slider reports its own volume", checks);
+            var volumeWrites = engine.Commands.Count(c => c.Text("command") == "set_device_volume");
+            rightSlider.Value = 44; await Pump();
+            // Compare only the writes issued after the snapshot: skipping raw command indexes would
+            // pull earlier session's writes back into the window.
+            Func<JsonElement, bool> targetedWrites = c => c.Text("command") == "set_device_volume" && c.GetProperty("params").Text("host") == "127.0.0.3";
+            await Until(() => engine.Commands.Where(c => c.Text("command") == "set_device_volume").Skip(volumeWrites).Any(targetedWrites));
+            Check(engine.Commands.Where(c => c.Text("command") == "set_device_volume").Skip(volumeWrites).All(targetedWrites), "only the targeted device receives the write", checks);
+            Check(app.MasterVolume == 25, "a per-device edit does not touch the master volume", checks);
+            // Display falls back to the pending target, so the confirmation has to clear the status too.
+            await Until(() => app.DeviceVolumes[1].Volume == 44 && app.DeviceVolumes[0].Volume == 28 && app.DeviceVolumes[1].VolumeStatus.Length == 0);
+            Check(app.DeviceVolumes[1].VolumeStatus.Length == 0 && app.DeviceVolumes[1].VolumeText == "44%", "the targeted device confirms its new volume", checks);
+            Invoke(expandButton); await Pump();
+            Check(!app.DeviceVolumesExpanded, "the sub-entry collapses again", checks);
+            Invoke(stereoButton); await Until(() => app.Snapshot.State == PlaybackState.Idle && app.DeviceVolumes.Count == 0);
+            Check(!app.HasPerDeviceVolumes, "stopping the session removes the per-device rows", checks);
+            Invoke(playbackButton); await Until(() => app.Snapshot.State == PlaybackState.Streaming);
+            CheckPanelIcons(panel, app, checks);
             settings = new(app); settings.Show(); await Pump();
             iconEnvironment = IconVerification.Run(settings, tray, checks, directory);
             foreach (var message in new[] { 0x001a, 0x007e })
@@ -534,16 +566,24 @@ internal static class UiSmoke
     {
         private readonly Channel<JsonElement> _events = Channel.CreateUnbounded<JsonElement>();
         private CancellationTokenSource? _metrics;
-        private string _host = "";
-        private int _volume = 28;
+        private string[] _hosts = [];
+        private Dictionary<string, int> _volumes = [];
+        private void EmitVolume(string session, string[] hosts, string status, long? sequence) =>
+            Emit(session, new
+            {
+                @event = "device_volume", host = _hosts[0], volume = _volumes[_hosts[0]], sequence,
+                status = hosts.Contains(_hosts[0]) ? status : "confirmed", available = true,
+                members = _hosts.Select(h => new { host = h, volume = _volumes[h], status = hosts.Contains(h) ? status : "confirmed" }).ToArray()
+            });
         public Task SendAsync(string session, string command, object? parameters, CancellationToken cancellation)
         {
             factory.Commands.Enqueue(JsonSerializer.SerializeToElement(new { command, @params = parameters }));
             if (command == "start")
             {
-                _host = JsonSerializer.SerializeToElement(parameters).GetProperty("peers")[0].Text("host");
+                _hosts = JsonSerializer.SerializeToElement(parameters).GetProperty("peers").EnumerateArray().Select(p => p.Text("host")!).ToArray();
+                _volumes = _hosts.ToDictionary(h => h, _ => 28);
                 Emit(session, new { @event = "streaming" });
-                Emit(session, new { @event = "device_volume", host = _host, volume = _volume, sequence = 0, status = "confirmed", available = true });
+                EmitVolume(session, [], "confirmed", 0);
                 _metrics = new(); var token = _metrics.Token;
                 _ = Task.Run(async () => { try { while (!token.IsCancellationRequested) { Emit(session, new { @event = "capture_metrics", metrics = new { capture_to_send_p95_ms = 10.8, max_queue_age_ms = 11.8, underrun_packets = 0, dropped_frames = 0, input_rate = 48000 } }); Emit(session, new { @event = "transport_metrics", session_uptime_ms = 123456, sender_late_recoveries = 2, skipped_packets = 10, members = new[] { new { host = "192.0.2.1", media = new { packets_sent = 12000, media_send_errors = 1, sync_send_errors = 0, retransmit_requests = 6, retransmits_sent = 5, retransmit_missing = 0, retransmit_expired = 1, retransmit_queue_drops = 0, retransmit_send_errors = 0, receiver_latency_ms = 150, receiver_latency_estimated = true }, health = new { feedback_rtt_ms = 4.2, feedback_failures = 0, feedback_delayed = false } } } }); await Task.Delay(350, token); } } catch (OperationCanceledException) { } }, CancellationToken.None);
             }
@@ -551,10 +591,13 @@ internal static class UiSmoke
             {
                 var data = JsonSerializer.SerializeToElement(parameters);
                 var value = (int)data.Number("volume")!; var sequence = data.Integer("sequence");
-                Emit(session, new { @event = "device_volume", host = _host, volume = _volume, sequence, status = "pending", available = true });
+                // A host targets one device; without one the whole session is written.
+                var targets = data.Text("host") is { Length: > 0 } host ? _hosts.Where(h => h == host).ToArray() : _hosts;
+                EmitVolume(session, targets, "pending", sequence);
                 _ = Task.Run(async () => {
-                    await Task.Delay(350); _volume = value;
-                    Emit(session, new { @event = "device_volume", host = _host, volume = _volume, sequence, status = "confirmed", available = true });
+                    await Task.Delay(350);
+                    foreach (var target in targets) _volumes[target] = value;
+                    EmitVolume(session, targets, "confirmed", sequence);
                 });
             }
             if (command == "stop") _events.Writer.TryComplete();

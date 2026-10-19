@@ -421,6 +421,66 @@ public sealed class SessionTests
         await Until(() => controller.Snapshot.DeviceVolume?.Actual == 32);
         Assert.DoesNotContain(second.Commands, c => c.Command == "set_device_volume");
     }
+    [Fact]
+    public async Task TargetedVolumeWritesOnlyItsDeviceAndTimesOutAlone()
+    {
+        var process = new FakeConnection(); await using var controller = new SessionController(new FakeFactory(process), new FakeAudio(), timing: Fast);
+        var group = Pod("stereo:pair") with { Members = [Pod(), new Receiver("leader", "leader", "127.0.0.2") { IsLeader = true }] };
+        await controller.StartAsync(group, Settings()); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        process.EmitData(new
+        {
+            @event = "device_volume", host = "127.0.0.2", volume = 28, sequence = 0, status = "confirmed", available = true,
+            members = new[]
+            {
+                new { host = "127.0.0.2", volume = 28, status = "confirmed" },
+                new { host = "127.0.0.1", volume = 25, status = "confirmed" }
+            }
+        });
+        await Until(() => controller.Snapshot.DeviceVolume?.Member("127.0.0.1") is { Available: true });
+        // An unknown device address is refused before it reaches the engine.
+        await controller.SetDeviceVolumeAsync("stereo:pair", 50, "127.0.0.9");
+        await Task.Delay(250);
+        Assert.DoesNotContain(process.Commands, c => c.Command == "set_device_volume");
+        var edit = controller.SetDeviceVolumeAsync("stereo:pair", 70, "127.0.0.1");
+        await Until(() => process.Commands.Any(c => c.Command == "set_device_volume"));
+        var command = Assert.Single(process.Commands, c => c.Command == "set_device_volume");
+        Assert.Equal(70, command.Parameters.Number("volume"));
+        Assert.Equal("127.0.0.1", command.Parameters.Text("host"));
+        var sequence = command.Parameters.Integer("sequence");
+        // Only the targeted device waits; the receiver-wide card keeps its confirmed value.
+        process.EmitData(new
+        {
+            @event = "device_volume", host = "127.0.0.2", volume = 28, sequence, status = "confirmed", available = true,
+            members = new[]
+            {
+                new { host = "127.0.0.2", volume = 28, status = "confirmed" },
+                new { host = "127.0.0.1", volume = 25, status = "pending" }
+            }
+        });
+        await Until(() => controller.Snapshot.DeviceVolume?.Member("127.0.0.1")?.Display == 70);
+        Assert.Equal(28, controller.Snapshot.DeviceVolume!.Display);
+        Assert.Null(controller.Snapshot.DeviceVolume.Target);
+        Assert.Equal("confirmed", controller.Snapshot.DeviceVolume.Status);
+        process.EmitData(new
+        {
+            @event = "device_volume", host = "127.0.0.2", volume = 28, sequence, status = "confirmed", available = true,
+            members = new[]
+            {
+                new { host = "127.0.0.2", volume = 28, status = "confirmed" },
+                new { host = "127.0.0.1", volume = 70, status = "confirmed" }
+            }
+        });
+        await Until(() => controller.Snapshot.DeviceVolume?.Member("127.0.0.1")?.Target is null);
+        await edit;
+        // A targeted edit that never reaches its device times out without touching the others.
+        var timedOut = controller.SetDeviceVolumeAsync("stereo:pair", 90, "127.0.0.1");
+        await Until(() => process.Commands.Count(c => c.Command == "set_device_volume") == 2);
+        await timedOut;
+        Assert.Equal("unconfirmed", controller.Snapshot.DeviceVolume!.Member("127.0.0.1")!.Status);
+        Assert.Equal("confirmed", controller.Snapshot.DeviceVolume.Member("127.0.0.2")!.Status);
+        Assert.Equal("confirmed", controller.Snapshot.DeviceVolume.Status);
+        Assert.True(controller.Snapshot.DeviceVolume.Available);
+    }
     private sealed class FakeFactory(params FakeConnection[] processes) : IEngineFactory
     {
         private readonly ConcurrentQueue<FakeConnection> _processes = new(processes);

@@ -4,27 +4,34 @@ use crate::rtsp::{Cancellation, Connection};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex, mpsc},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
-#[derive(Clone, Copy, Debug)]
+/// Commands without a device target apply to every device in the session.
+pub const ALL_DEVICES: &str = "*";
+
+#[derive(Clone, Debug)]
 pub struct Command {
     pub sequence: u64,
     pub percent: u8,
+    /// None applies to every device in the session; Some targets one device.
+    pub host: Option<String>,
 }
 #[derive(Clone, Default)]
-pub struct Control(Arc<Mutex<Option<Command>>>);
+pub struct Control(Arc<Mutex<HashMap<String, Command>>>);
 impl Control {
     pub fn set(&self, command: Command) {
+        let key = command.host.clone().unwrap_or_else(|| ALL_DEVICES.to_string());
         let mut latest = self.0.lock().unwrap();
-        if latest.is_none_or(|old| command.sequence > old.sequence) {
-            *latest = Some(command);
+        if latest.get(&key).is_none_or(|old| command.sequence > old.sequence) {
+            latest.insert(key, command);
         }
     }
-    fn latest(&self) -> Option<Command> {
-        *self.0.lock().unwrap()
+    fn latest(&self) -> HashMap<String, Command> {
+        self.0.lock().unwrap().clone()
     }
 }
 pub type Peer = (String, String, Arc<Mutex<Connection>>);
@@ -55,7 +62,7 @@ fn read(connection: &mut Connection) -> Result<u8> {
         .context("invalid initialVolume type")?;
     from_db(db)
 }
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Pending {
     command: Option<Command>,
     sent: Option<Instant>,
@@ -63,9 +70,10 @@ struct Pending {
     settled: bool,
 }
 impl Pending {
-    fn status(&mut self, values: &[Option<u8>], now: Instant) -> &'static str {
+    /// A session-wide command needs every device to reach the requested value.
+    fn evaluate_all(&mut self, values: &[Option<u8>], now: Instant) -> &'static str {
         let readable = values.iter().all(Option::is_some);
-        if let Some(command) = self.command {
+        if let Some(command) = &self.command {
             if !self.settled {
                 if !self.write_failed
                     && readable
@@ -87,6 +95,68 @@ impl Pending {
         }
         if readable { "confirmed" } else { "unsynced" }
     }
+    /// A targeted command only waits for the one device it addressed.
+    fn evaluate_one(&mut self, value: Option<u8>, now: Instant) -> &'static str {
+        if let Some(command) = &self.command {
+            if !self.settled {
+                if !self.write_failed && value == Some(command.percent) {
+                    self.settled = true;
+                    return "confirmed";
+                }
+                if !self.write_failed
+                    && self
+                        .sent
+                        .is_some_and(|at| now.duration_since(at) < Duration::from_secs(3))
+                {
+                    return "pending";
+                }
+                self.settled = true;
+                return "unconfirmed";
+            }
+        }
+        if value.is_some() { "confirmed" } else { "unsynced" }
+    }
+}
+/// Report one device against its own command first, then a session-wide one.
+fn member_status(
+    peers: &[Peer],
+    index: usize,
+    values: &[Option<u8>],
+    pending: &mut HashMap<String, Pending>,
+    now: Instant,
+) -> String {
+    let host = &peers[index].0;
+    let own = pending.get(host).and_then(|p| p.command.as_ref()).map(|c| c.sequence);
+    let all = pending.get(ALL_DEVICES).and_then(|p| p.command.as_ref()).map(|c| c.sequence);
+    if own.is_some_and(|sequence| all.is_none_or(|latest| sequence > latest)) {
+        return pending
+            .get_mut(host)
+            .expect("targeted pending entry")
+            .evaluate_one(values[index], now)
+            .to_string();
+    }
+    if all.is_some() {
+        // A device with a newer targeted command waits for that command alone.
+        let latest = all.unwrap_or_default();
+        let scoped: Vec<Option<u8>> = peers
+            .iter()
+            .enumerate()
+            .filter(|&(position, (host, _, _))| {
+                position == index
+                    || !pending
+                        .get(host)
+                        .and_then(|p| p.command.as_ref())
+                        .is_some_and(|c| c.sequence > latest)
+            })
+            .map(|(position, _)| values[position])
+            .collect();
+        return pending
+            .get_mut(ALL_DEVICES)
+            .expect("session-wide pending entry")
+            .evaluate_all(&scoped, now)
+            .to_string();
+    }
+    if values[index].is_some() { "confirmed".into() } else { "unsynced".into() }
 }
 pub struct Worker {
     stop: Cancellation,
@@ -101,30 +171,46 @@ impl Worker {
         let done = stop.clone();
         let (tx, events) = mpsc::sync_channel(32);
         let worker = thread::Builder::new().name("airplay-volume".into()).spawn(move || {
-            let mut pending = Pending::default();
+            let mut pending: HashMap<String, Pending> = HashMap::new();
             let mut next = Instant::now();
             while !done.is_cancelled() {
-                let command = control.latest();
-                let changed = command.map(|c| c.sequence) != pending.command.map(|c| c.sequence);
-                if !changed && Instant::now() < next {
-                    thread::sleep(Duration::from_millis(20));
-                    continue;
-                }
+                let commands = control.latest();
                 let mut errors = Vec::new();
-                if changed {
-                    pending = Pending { command, sent: Some(Instant::now()), ..Pending::default() };
-                    if let Some(command) = command {
-                        for (host, uri, connection) in &peers {
-                            if done.is_cancelled() { return; }
-                            let result = connection.lock().unwrap().request("SET_PARAMETER", uri,
-                                &[("Content-Type", "text/parameters".into())],
-                                format!("volume: {:.6}\r\n", to_db(command.percent)).as_bytes());
-                            if let Err(error) = result {
-                                pending.write_failed = true;
-                                errors.push(format!("{host}: {error:#}"));
-                            }
+                let mut wrote = false;
+                for (key, command) in &commands {
+                    let stale = pending
+                        .get(key)
+                        .is_some_and(|p| p.command.as_ref().is_some_and(|c| c.sequence >= command.sequence));
+                    if stale {
+                        continue;
+                    }
+                    let entry = pending.entry(key.clone()).or_default();
+                    *entry = Pending { command: Some(command.clone()), sent: Some(Instant::now()), ..Pending::default() };
+                    // Each device keeps its newest command: a session-wide write skips
+                    // devices with a newer targeted one, and a targeted write yields to a
+                    // newer session-wide one. Order inside a cycle cannot matter then.
+                    let targets: Vec<&Peer> = match &command.host {
+                        Some(host) if commands.get(ALL_DEVICES).is_some_and(|wide| wide.sequence > command.sequence) => Vec::new(),
+                        Some(host) => peers.iter().filter(|(h, _, _)| h == host).collect(),
+                        None => peers.iter().filter(|(host, _, _)| {
+                            !commands.get(host.as_str()).is_some_and(|own| own.sequence > command.sequence)
+                        }).collect(),
+                    };
+                    for (host, uri, connection) in targets {
+                        if done.is_cancelled() { return; }
+                        let result = connection.lock().unwrap().request("SET_PARAMETER", uri,
+                            &[("Content-Type", "text/parameters".into())],
+                            format!("volume: {:.6}\r\n", to_db(command.percent)).as_bytes());
+                        if let Err(error) = result {
+                            entry.write_failed = true;
+                            errors.push(format!("{host}: {error:#}"));
                         }
                     }
+                    wrote = true;
+                }
+                if !wrote && Instant::now() < next {
+                    thread::sleep(Duration::from_millis(20));
+                    continue;
                 }
                 let mut values = Vec::new();
                 for (host, _, connection) in &peers {
@@ -134,13 +220,14 @@ impl Worker {
                         Err(error) => { values.push(None); errors.push(format!("{host}: {error:#}")); }
                     }
                 }
-                let status = pending.status(&values, Instant::now());
-                let event = json!({"event":"device_volume", "host":peers[0].0,
-                    "sequence":pending.command.map_or(0, |c| c.sequence),
-                    "volume":values[0], "available":values.iter().all(Option::is_some),
-                    "status":status, "message":errors.join("; "),
-                    "members":peers.iter().zip(&values).map(|((host,_,_),v)| json!({"host":host,"volume":v})).collect::<Vec<_>>()});
-                let _ = tx.try_send(event);
+                let now = Instant::now();
+                let members: Vec<Value> = peers.iter().zip(&values).enumerate().map(|(index, ((host, _, _), value))| {
+                    json!({"host":host,"volume":value,"status":member_status(&peers, index, &values, &mut pending, now)})
+                }).collect();
+                let _ = tx.try_send(json!({"event":"device_volume","host":peers[0].0,
+                    "sequence":pending.values().filter_map(|p| p.command.clone()).map(|c| c.sequence).max().unwrap_or(0),
+                    "volume":values[0],"available":values.iter().all(Option::is_some),
+                    "status":members[0]["status"],"message":errors.join("; "),"members":members}));
                 next = Instant::now() + Duration::from_secs(1);
             }
         })?;
@@ -179,15 +266,16 @@ mod tests {
             command: Some(Command {
                 sequence: 1,
                 percent: 40,
+                host: None,
             }),
             sent: Some(now),
             ..Pending::default()
         };
-        assert_eq!(pending.status(&[Some(20), Some(20)], now), "pending");
-        assert_eq!(pending.status(&[Some(40), Some(20)], now), "pending");
-        assert_eq!(pending.status(&[Some(40), Some(40)], now), "confirmed");
+        assert_eq!(pending.evaluate_all(&[Some(20), Some(20)], now), "pending");
+        assert_eq!(pending.evaluate_all(&[Some(40), Some(20)], now), "pending");
+        assert_eq!(pending.evaluate_all(&[Some(40), Some(40)], now), "confirmed");
         // External physical changes are authoritative once the write is confirmed.
-        assert_eq!(pending.status(&[Some(45), Some(45)], now), "confirmed");
+        assert_eq!(pending.evaluate_all(&[Some(45), Some(45)], now), "confirmed");
     }
     #[test]
     fn timeout_and_missing_reads_do_not_confirm() {
@@ -196,19 +284,58 @@ mod tests {
             command: Some(Command {
                 sequence: 1,
                 percent: 40,
+                host: None,
             }),
             sent: Some(now),
             ..Pending::default()
         };
-        assert_eq!(pending.status(&[None], now), "pending");
+        assert_eq!(pending.evaluate_all(&[None], now), "pending");
         assert_eq!(
-            pending.status(&[Some(20)], now + Duration::from_secs(3)),
+            pending.evaluate_all(&[Some(20)], now + Duration::from_secs(3)),
             "unconfirmed"
         );
         assert_eq!(
-            pending.status(&[None], now + Duration::from_secs(4)),
+            pending.evaluate_all(&[None], now + Duration::from_secs(4)),
             "unsynced"
         );
+    }
+    #[test]
+    fn targeted_command_confirms_its_own_device_only() {
+        let now = Instant::now();
+        let mut targeted = Pending {
+            command: Some(Command {
+                sequence: 1,
+                percent: 40,
+                host: Some("192.0.2.10".into()),
+            }),
+            sent: Some(now),
+            ..Pending::default()
+        };
+        // The other device keeps its old value; the targeted one settles alone.
+        assert_eq!(targeted.evaluate_one(Some(20), now), "pending");
+        assert_eq!(targeted.evaluate_one(Some(40), now), "confirmed");
+        // A targeted write that never reaches its device times out alone.
+        let mut late = Pending {
+            command: Some(Command {
+                sequence: 2,
+                percent: 40,
+                host: Some("192.0.2.10".into()),
+            }),
+            sent: Some(now),
+            ..Pending::default()
+        };
+        assert_eq!(late.evaluate_one(Some(20), now + Duration::from_secs(4)), "unconfirmed");
+    }
+    #[test]
+    fn control_tracks_each_device_separately() {
+        let control = Control::default();
+        control.set(Command { sequence: 2, percent: 30, host: Some("192.0.2.10".into()) });
+        control.set(Command { sequence: 1, percent: 80, host: Some("192.0.2.10".into()) });
+        control.set(Command { sequence: 3, percent: 55, host: None });
+        let latest = control.latest();
+        assert_eq!(latest.len(), 2);
+        assert_eq!(latest.get("192.0.2.10").unwrap().percent, 30);
+        assert_eq!(latest.get(ALL_DEVICES).unwrap().percent, 55);
     }
     #[test]
     fn latest_command_wins() {
@@ -216,11 +343,13 @@ mod tests {
         control.set(Command {
             sequence: 2,
             percent: 30,
+            host: None,
         });
         control.set(Command {
             sequence: 1,
             percent: 80,
+            host: None,
         });
-        assert_eq!(control.latest().unwrap().percent, 30);
+        assert_eq!(control.latest().get(ALL_DEVICES).unwrap().percent, 30);
     }
 }

@@ -112,17 +112,21 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     private DeviceVolumeState _deviceVolume = new();
     private long _volumeSequence;
     private CancellationTokenSource? _volumeEdit;
-    public async Task SetDeviceVolumeAsync(string receiverId, int value)
+    // The pending target of an edit: the receiver-wide one, or a single targeted device.
+    private int? PendingVolume(string? host) => host is null ? _deviceVolume.Target : _deviceVolume.Member(host)?.Target;
+    public async Task SetDeviceVolumeAsync(string receiverId, int value, string? host = null)
     {
         CancellationToken token;
         long sequence, epoch;
         lock (_sync)
         {
-            if (_receiver?.Id != receiverId || !_deviceVolume.Available || _snapshot.State is not (PlaybackState.Streaming or PlaybackState.Standby)) return;
+            if (_receiver?.Id != receiverId || _snapshot.State is not (PlaybackState.Streaming or PlaybackState.Standby)) return;
+            // A session-wide edit needs every device readable; a targeted one needs only its own.
+            if (host is null ? !_deviceVolume.Available : _deviceVolume.Member(host)?.Available != true) return;
             _volumeEdit?.Cancel(); _volumeEdit?.Dispose();
             _volumeEdit = CancellationTokenSource.CreateLinkedTokenSource(_lifetime!.Token);
             token = _volumeEdit.Token; sequence = ++_volumeSequence; epoch = _generation;
-            _deviceVolume = _deviceVolume.Begin(Math.Clamp(value, 0, 100), sequence);
+            _deviceVolume = _deviceVolume.Begin(Math.Clamp(value, 0, 100), sequence, host);
         }
         PublishCurrent(epoch);
         try
@@ -134,18 +138,18 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                 IEngineConnection? connection; string? session;
                 lock (_sync)
                 {
-                    if (epoch != _generation || sequence != _deviceVolume.Sequence) return;
+                    if (epoch != _generation || sequence != _deviceVolume.Sequence || PendingVolume(host) is null) return;
                     connection = _connection; session = _sessionId;
                 }
                 if (connection is null || session is null) return;
-                await connection.SendAsync(session, "set_device_volume", new { volume = Math.Clamp(value, 0, 100), sequence }, token).ConfigureAwait(false);
+                await connection.SendAsync(session, "set_device_volume", new { volume = Math.Clamp(value, 0, 100), sequence, host }, token).ConfigureAwait(false);
             }
             finally { _serial.Release(); }
             await Task.Delay(TimeSpan.FromSeconds(3), token).ConfigureAwait(false);
             lock (_sync)
             {
-                if (epoch != _generation || sequence != _deviceVolume.Sequence || _deviceVolume.Target is null) return;
-                _deviceVolume = _deviceVolume.Timeout();
+                if (epoch != _generation || sequence != _deviceVolume.Sequence || PendingVolume(host) is null) return;
+                _deviceVolume = _deviceVolume.Timeout(host);
             }
             PublishCurrent(epoch);
         }
@@ -155,7 +159,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
             lock (_sync)
             {
                 if (epoch != _generation || sequence != _deviceVolume.Sequence) return;
-                _deviceVolume = _deviceVolume.Timeout() with { Available = false };
+                _deviceVolume = _deviceVolume.Timeout(host) with { Available = false };
             }
             log?.Invoke($"Device volume command failed: {error.Message}");
             PublishCurrent(epoch);
@@ -383,11 +387,15 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                             lock (_sync)
                             {
                                 if (epoch != _generation) continue;
-                                var wasPending = _deviceVolume.Target is not null;
+                                var wasPending = _deviceVolume.Target is not null || _deviceVolume.Members?.Any(m => m.Target is not null) == true;
                                 _deviceVolume = _deviceVolume.Receive(item);
-                                if (wasPending && _deviceVolume.Target is null) _volumeEdit?.Cancel();
+                                if (wasPending && _deviceVolume.Target is null && _deviceVolume.Members?.Any(m => m.Target is not null) != true) _volumeEdit?.Cancel();
                             }
                             PublishCurrent(epoch);
+                        }
+                        else if (kind == "device_volume_error" && startedAt != 0)
+                        {
+                            log?.Invoke($"Device volume rejected: {item.Text("message")}");
                         }
                         else if (kind == "warning" && startedAt != 0)
                         {

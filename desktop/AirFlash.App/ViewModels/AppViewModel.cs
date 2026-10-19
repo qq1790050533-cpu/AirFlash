@@ -61,6 +61,17 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     public string MonitorWarnings => _snapshot.Diagnostics?.Warnings is { Count: > 0 } warnings ? string.Join("\n", warnings.Select(w => w.Detail)) : "—";
     public string MonitorLastFault => _snapshot.Diagnostics?.LastFault?.Detail ?? "—";
     public ObservableCollection<TransportMemberViewModel> MonitorMembers { get; } = [];
+    public ObservableCollection<DeviceVolumeViewModel> DeviceVolumes { get; } = [];
+    private bool _deviceVolumesExpanded;
+    public bool DeviceVolumesExpanded
+    {
+        get => _deviceVolumesExpanded;
+        set { _deviceVolumesExpanded = value; Notify(); Notify(nameof(PerDeviceVolumesVisible)); }
+    }
+    /// A session with two or more physical devices offers one slider per device.
+    public bool HasPerDeviceVolumes => DeviceVolumes.Count > 1;
+    public bool PerDeviceVolumesVisible => HasPerDeviceVolumes && DeviceVolumesExpanded;
+    public RelayCommand ToggleDeviceVolumesCommand { get; }
     public string MonitorBeforeFault
     {
         get
@@ -125,6 +136,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         _discoverySearchTimer.Stop();
         StopCommand = new(() => StopAsync(), ShowError, () => _snapshot.IsActive);
         MuteCommand = new(async () => { await Session.SetMutedAsync(!Session.Muted); Notify(nameof(Muted)); Notify(nameof(MuteLabel)); }, ShowError);
+        ToggleDeviceVolumesCommand = new(() => DeviceVolumesExpanded = !DeviceVolumesExpanded, () => HasPerDeviceVolumes);
         MergeManualReceivers();
     }
     public void Start()
@@ -327,8 +339,41 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
             StopCommand.Refresh();
         }
         foreach (var row in Receivers) row.Refresh();
+        RefreshDeviceVolumes();
         if (_monitorVisible) RefreshMonitor();
     });
+    // One row per physical device of the active session, ordered with the leader first.
+    private void RefreshDeviceVolumes()
+    {
+        var active = _snapshot;
+        var streaming = active.State is PlaybackState.Streaming or PlaybackState.Standby;
+        var members = streaming ? active.DeviceVolume?.Members ?? [] : [];
+        var peers = streaming ? active.Receiver?.Peers.ToArray() ?? [] : [];
+        var hadPerDeviceVolumes = HasPerDeviceVolumes;
+        foreach (var row in DeviceVolumes.Where(r => members.All(m => m.Host != r.Host)).ToArray()) DeviceVolumes.Remove(row);
+        for (var i = 0; i < members.Count; i++)
+        {
+            var member = members[i];
+            var row = DeviceVolumes.FirstOrDefault(r => r.Host == member.Host);
+            if (row is null)
+            {
+                // The engine reports members in the order the peers were sent: leader first.
+                var name = i < peers.Length ? peers[i].Name : member.Host;
+                row = new DeviceVolumeViewModel(this, active.Receiver?.Id ?? "", member.Host, name);
+                DeviceVolumes.Add(row);
+            }
+            row.Update(member);
+        }
+        // The sub-entry only exists for a multi-device session; HasPerDeviceVolumes derives from the
+        // collection, so the flip has to be detected against the state before the rows were synced.
+        if (hadPerDeviceVolumes != HasPerDeviceVolumes)
+        {
+            Notify(nameof(HasPerDeviceVolumes));
+            Notify(nameof(PerDeviceVolumesVisible));
+            ToggleDeviceVolumesCommand.Refresh();
+            if (DeviceVolumesExpanded && !HasPerDeviceVolumes) DeviceVolumesExpanded = false;
+        }
+    }
     public void SetMonitorVisible(bool visible)
     {
         _monitorVisible = visible;
@@ -403,7 +448,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         }
         else await Session.SetDeviceVolumeAsync(id, 0);
     }
-    public Task SetReceiverVolumeAsync(string id, int value) => Session.SetDeviceVolumeAsync(id, value);
+    public Task SetReceiverVolumeAsync(string id, int value, string? host = null) => Session.SetDeviceVolumeAsync(id, value, host);
     private void VolumeChanged() { _editRevision++; _volumeDirty = true; _volumeTimer.Stop(); if (!_closing) _volumeTimer.Start(); }
     public async Task FlushVolumeAsync()
     {
@@ -502,6 +547,30 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
 public sealed record SettingsApplyResult(AppSettings Saved, string? AudioError)
 {
     public bool AudioUpdated => AudioError is null;
+}
+public sealed class DeviceVolumeViewModel(AppViewModel app, string receiverId, string host, string name) : ObservableObject
+{
+    private DeviceMemberVolume _member = new(host);
+    public string Host => host;
+    public string Name => name;
+    public string Detail => host;
+    public int Volume { get => _member.Display ?? 0; set { if (Volume != value && CanSetVolume) _ = SetVolumeAsync(value); } }
+    private async Task SetVolumeAsync(int value)
+    {
+        try { await app.SetReceiverVolumeAsync(receiverId, value, host); }
+        catch (Exception error) { app.ShowError(error); }
+    }
+    public string VolumeText => _member.Display is { } value ? $"{value}%" : "—";
+    public string VolumeStatus => _member.Status switch {
+        "pending" => L.Get("Synchronizing…"), "unconfirmed" => L.Get("Volume not confirmed"),
+        "unsynced" => L.Get("Volume not synchronized"), _ => "" };
+    public bool CanSetVolume => _member.Available;
+    public void Update(DeviceMemberVolume member)
+    {
+        if (_member == member) return;
+        _member = member;
+        Notify(nameof(Volume)); Notify(nameof(VolumeText)); Notify(nameof(VolumeStatus)); Notify(nameof(CanSetVolume));
+    }
 }
 public sealed class ReceiverViewModel : ObservableObject
 {

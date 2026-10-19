@@ -141,6 +141,7 @@
   "Stream sample rate": "串流取樣率",
   "Select a valid stream sample rate.": "請選擇有效的串流取樣率。",
   "Master volume": "主音量",
+  "Per-device volume": "各裝置音量",
   "View error details": "檢視錯誤詳情",
   "AirFlash settings": "AirFlash 設定",
   "Startup and connection": "啟動與連線",

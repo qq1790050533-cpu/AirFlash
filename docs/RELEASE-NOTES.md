@@ -10,10 +10,12 @@ Not yet released; entries below are local to the `audio-alignment` branch.
 - Play the streamed audio on a second local output with an adjustable alignment delay, so the computer's own speakers stay in sync with the AirPlay receivers. Set it in Settings → Audio capture → Local alignment; the delay applies without restarting the session. See [Audio alignment](https://github.com/Ding-Kyoma/AirFlash/blob/audio-alignment/docs/AUDIO-ALIGNMENT.md).
 - Assign each output — every AirPlay receiver member and the local playback device — to the left or the right channel, turning two devices into one stereo pair. A split must cover every output exactly once, and the rules are enforced by the engine and by Settings before the session starts.
 - Detect receiver latency automatically for the local alignment delay, using the latency each AirPlay device reports, and show the detected value in Settings → Monitor → Detected receiver latency.
+- Adjust the volume of each device in a session separately, next to the master volume: a sub-entry beside the total volume lists every device of the active session with its own slider and live status, so one HomePod of a stereo pair can be quieter than the other without changing the receiver-wide volume. Each slider writes only its device and reports its own confirmation state.
 
 ## Bug Fixes
 
 - Keep a failed session recoverable: saving settings that repair the previous failure — for example a channel split that now covers every output — retries the stream on the same receiver instead of leaving the session in the error state until it is stopped and started by hand.
+- Keep the control panel open when it is reopened from the tray while a previous dismissal is still pending: a stale deactivation callback no longer hides a panel that was shown again in the meantime.
 
 # AirFlash 0.4.0
 

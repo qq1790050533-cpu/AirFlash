@@ -11,7 +11,7 @@ use std::{
         atomic::{AtomicU8, AtomicUsize, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 type Fake = (
@@ -21,7 +21,7 @@ type Fake = (
     Cancellation,
     thread::JoinHandle<()>,
 );
-fn fake(initial: u8, reject: bool) -> Fake {
+fn fake(host: &str, initial: u8, reject: bool) -> Fake {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let connection =
         Connection::connect(listener.local_addr().unwrap(), Cancellation::default()).unwrap();
@@ -81,8 +81,8 @@ fn fake(initial: u8, reject: bool) -> Fake {
     });
     (
         (
-            "127.0.0.1".into(),
-            "rtsp://127.0.0.1/test".into(),
+            host.to_string(),
+            format!("rtsp://{host}/test"),
             Arc::new(Mutex::new(connection)),
         ),
         value,
@@ -93,8 +93,8 @@ fn fake(initial: u8, reject: bool) -> Fake {
 }
 #[test]
 fn initial_read_physical_change_pair_write_and_delayed_confirmation() {
-    let (leader, volume, sets1, stop1, server1) = fake(28, false);
-    let (member, _, sets2, stop2, server2) = fake(25, false);
+    let (leader, volume, sets1, stop1, server1) = fake("127.0.0.1", 28, false);
+    let (member, _, sets2, stop2, server2) = fake("127.0.0.1", 25, false);
     let control = Control::default();
     let worker = Worker::start(vec![leader, member], control.clone()).unwrap();
     let initial = worker.events.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -107,6 +107,7 @@ fn initial_read_physical_change_pair_write_and_delayed_confirmation() {
     control.set(Command {
         sequence: 1,
         percent: 40,
+        host: None,
     });
     let old = worker.events.recv_timeout(Duration::from_secs(2)).unwrap();
     assert_eq!(old["sequence"], 1);
@@ -124,8 +125,46 @@ fn initial_read_physical_change_pair_write_and_delayed_confirmation() {
     server2.join().unwrap();
 }
 #[test]
+fn a_newer_session_wide_command_supersedes_a_targeted_one() {
+    let (leader, volume1, sets1, stop1, server1) = fake("127.0.0.1", 28, false);
+    let (member, _, sets2, stop2, server2) = fake("127.0.0.2", 25, false);
+    let control = Control::default();
+    let worker = Worker::start(vec![leader, member], control.clone()).unwrap();
+    let initial = worker.events.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(initial["members"][0]["volume"], 28);
+    assert_eq!(initial["members"][1]["volume"], 25);
+    control.set(Command { sequence: 1, percent: 60, host: Some("127.0.0.2".into()) });
+    let pending = loop {
+        let event = worker.events.recv_timeout(Duration::from_secs(2)).unwrap();
+        if event["members"][1]["status"] == "pending" { break event; }
+    };
+    assert_eq!(pending["members"][0]["status"], "confirmed");
+    control.set(Command { sequence: 2, percent: 40, host: None });
+    let deadline = Instant::now() + Duration::from_secs(6);
+    let confirmed = loop {
+        let event = worker
+            .events
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap();
+        if event["members"][0]["status"] == "confirmed" && event["members"][1]["status"] == "confirmed" {
+            break event;
+        }
+    };
+    // Both devices settle on the newer session-wide value; neither reports a timeout.
+    assert_eq!(confirmed["members"][0]["volume"], 40);
+    assert_eq!(confirmed["members"][1]["volume"], 40);
+    assert_eq!(volume1.load(Ordering::Relaxed), 40);
+    assert_eq!(sets1.load(Ordering::Relaxed), 1);
+    assert_eq!(sets2.load(Ordering::Relaxed), 2);
+    stop1.cancel();
+    stop2.cancel();
+    drop(worker);
+    server1.join().unwrap();
+    server2.join().unwrap();
+}
+#[test]
 fn unsupported_query_does_not_invent_volume() {
-    let (peer, _, sets, stop, server) = fake(28, true);
+    let (peer, _, sets, stop, server) = fake("127.0.0.1", 28, true);
     let worker = Worker::start(vec![peer], Control::default()).unwrap();
     let event = worker.events.recv_timeout(Duration::from_secs(2)).unwrap();
     assert!(event["volume"].is_null());
@@ -135,4 +174,42 @@ fn unsupported_query_does_not_invent_volume() {
     stop.cancel();
     drop(worker);
     server.join().unwrap();
+}
+#[test]
+fn targeted_command_writes_only_its_device() {
+    let (leader, volume, sets1, stop1, server1) = fake("127.0.0.1", 28, false);
+    let (member, _, sets2, stop2, server2) = fake("127.0.0.2", 25, false);
+    let control = Control::default();
+    let worker = Worker::start(vec![leader, member], control.clone()).unwrap();
+    let initial = worker.events.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(initial["members"][0]["volume"], 28);
+    assert_eq!(initial["members"][1]["volume"], 25);
+    volume.store(32, Ordering::Relaxed);
+    let external = worker.events.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(external["members"][0]["volume"], 32);
+    control.set(Command { sequence: 1, percent: 60, host: Some("127.0.0.2".into()) });
+    let pending = worker.events.recv_timeout(Duration::from_secs(2)).unwrap();
+    // The leader keeps its own value and stays confirmed; only the member waits.
+    assert_eq!(pending["members"][0]["status"], "confirmed");
+    assert_eq!(pending["members"][1]["status"], "pending");
+    assert_eq!(pending["status"], "confirmed");
+    let deadline = Instant::now() + Duration::from_secs(6);
+    let confirmed = loop {
+        let event = worker
+            .events
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap();
+        if event["members"][1]["status"] == "confirmed" {
+            break event;
+        }
+    };
+    assert_eq!(confirmed["members"][1]["volume"], 60);
+    assert_eq!(confirmed["members"][0]["volume"], 32);
+    assert_eq!(sets1.load(Ordering::Relaxed), 0);
+    assert_eq!(sets2.load(Ordering::Relaxed), 1);
+    stop1.cancel();
+    stop2.cancel();
+    drop(worker);
+    server1.join().unwrap();
+    server2.join().unwrap();
 }

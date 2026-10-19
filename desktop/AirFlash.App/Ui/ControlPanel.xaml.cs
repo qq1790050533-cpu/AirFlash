@@ -17,6 +17,7 @@ public partial class ControlPanel : Window
     private bool _placing;
     private DispatcherOperation? _placement;
     private DateTime _lastDismissed;
+    private int _showGeneration;
     public bool MenuOpen { get; set; }
     public TrayService? Tray { get; set; }
     public event Action? SettingsRequested;
@@ -45,6 +46,7 @@ public partial class ControlPanel : Window
     }
     public void ShowPanel()
     {
+        _showGeneration++;
         Show(); RequestPlacement(); Activate();
     }
     public void RequestPlacement()
@@ -71,7 +73,9 @@ public partial class ControlPanel : Window
     }
     private void OnDeactivated(object sender, EventArgs args)
     {
-        Dispatcher.BeginInvoke(() => { if (!IsActive && !MenuOpen) { _lastDismissed = DateTime.UtcNow; Hide(); } }, DispatcherPriority.Background);
+        // A stale dismissal must not close a panel that was re-opened in the meantime.
+        var generation = _showGeneration;
+        Dispatcher.BeginInvoke(() => { if (generation == _showGeneration && !IsActive && !MenuOpen) { _lastDismissed = DateTime.UtcNow; Hide(); } }, DispatcherPriority.Background);
     }
     private void OnKeyDown(object sender, KeyEventArgs args) { if (args.Key == Key.Escape) { Hide(); args.Handled = true; } }
     private void OnClosing(object? sender, CancelEventArgs args) { if (!_allowClose) { args.Cancel = true; Hide(); } }
