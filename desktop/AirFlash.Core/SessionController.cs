@@ -6,7 +6,7 @@ namespace AirFlash.Core;
 
 public enum PlaybackState { Idle, Connecting, Streaming, Standby, Pairing, Error }
 public sealed record StreamMetrics(double? CaptureToSendP95 = null, double? MaxQueueAge = null, long? Underruns = null, long? DroppedFrames = null, int? InputRate = null);
-public sealed record SessionSnapshot(PlaybackState State, Receiver? Receiver = null, string Message = "", StreamMetrics? Metrics = null, int TargetLatency = 0, PlaybackDiagnostics? Diagnostics = null, int StreamRate = 0, DeviceVolumeState? DeviceVolume = null, int? AutoAlignmentDelay = null)
+public sealed record SessionSnapshot(PlaybackState State, Receiver? Receiver = null, string Message = "", StreamMetrics? Metrics = null, int TargetLatency = 0, PlaybackDiagnostics? Diagnostics = null, int StreamRate = 0, DeviceVolumeState? DeviceVolume = null, int? AutoAlignmentDelay = null, int? LocalVolume = null, bool LocalVolumeAvailable = false)
 {
     public bool IsActive => State is PlaybackState.Connecting or PlaybackState.Streaming or PlaybackState.Standby or PlaybackState.Pairing;
 }
@@ -173,6 +173,10 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     private PlaybackDiagnostics _diagnostics = new();
     private readonly Dictionary<string, EngineNotice> _warnings = [];
     private int? _autoAlignmentDelay;
+    /// Volume of the local output device as the engine last reported it.
+    private int? _localVolume;
+    private bool _localVolumeAvailable;
+    private CancellationTokenSource? _localVolumeEdit;
     private SessionSnapshot _snapshot = new(PlaybackState.Idle);
     public SessionSnapshot Snapshot { get { lock (_sync) return _snapshot; } }
     public event Action<SessionSnapshot>? Changed;
@@ -212,7 +216,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         await StopLockedAsync().ConfigureAwait(false);
         _settings = settings.Clone(); _receiver = receiver;
         var epoch = ++_generation;
-        lock (_sync) { _diagnostics = new(); _warnings.Clear(); _autoAlignmentDelay = null; _snapshot = new(PlaybackState.Idle); }
+        lock (_sync) { _diagnostics = new(); _warnings.Clear(); _autoAlignmentDelay = null; _localVolume = null; _localVolumeAvailable = false; _snapshot = new(PlaybackState.Idle); }
         _lifetime = new();
         var cancellation = _lifetime.Token;
         Publish(epoch, requestPin is null ? PlaybackState.Connecting : PlaybackState.Pairing);
@@ -237,7 +241,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     }
     private async Task StopLockedAsync()
     {
-        lock (_sync) { ++_generation; _volumeEdit?.Cancel(); _volumeEdit?.Dispose(); _volumeEdit = null; _deviceVolume = new(); }
+        lock (_sync) { ++_generation; _volumeEdit?.Cancel(); _volumeEdit?.Dispose(); _volumeEdit = null; _deviceVolume = new(); _localVolumeEdit?.Cancel(); _localVolumeEdit?.Dispose(); _localVolumeEdit = null; _localVolume = null; _localVolumeAvailable = false; }
         if (_lifetime is not null) await _lifetime.CancelAsync().ConfigureAwait(false);
         if (_work is not null) await _work.ConfigureAwait(false);
         _lifetime?.Dispose(); _lifetime = null; _work = null;
@@ -284,6 +288,28 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         finally { _serial.Release(); }
     }
     /// Adjust the local alignment delay without restarting the session.
+    /// Balance the local speakers against the receivers; the engine writes the endpoint volume.
+    public async Task SetLocalVolumeAsync(int value)
+    {
+        CancellationToken token;
+        lock (_sync)
+        {
+            if (_snapshot.State is not (PlaybackState.Streaming or PlaybackState.Standby) || !_localVolumeAvailable) return;
+            _localVolumeEdit?.Cancel(); _localVolumeEdit?.Dispose();
+            _localVolumeEdit = CancellationTokenSource.CreateLinkedTokenSource(_lifetime!.Token);
+            token = _localVolumeEdit.Token;
+        }
+        try
+        {
+            // Slider drags arrive as a burst; only the settled value reaches the endpoint.
+            await Task.Delay(120, token).ConfigureAwait(false);
+            IEngineConnection? connection; string? session;
+            lock (_sync) { if (_snapshot.State is not (PlaybackState.Streaming or PlaybackState.Standby)) return; connection = _connection; session = _sessionId; }
+            if (connection is null || session is null) return;
+            await connection.SendAsync(session, "set_local_volume", new { volume = Math.Clamp(value, 0, 100) }, token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+    }
     public async Task SetLocalPlaybackDelayAsync(int delayMs)
     {
         await _serial.WaitAsync().ConfigureAwait(false);
@@ -339,7 +365,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                 SetConnection(connection, session);
                 try
                 {
-                    lock (_sync) { if (epoch == _generation) { _diagnostics = _diagnostics with { Transport = null, Warnings = [] }; _warnings.Clear(); _deviceVolume = new(); _volumeEdit?.Cancel(); _snapshot = _snapshot with { Metrics = null }; } }
+                    lock (_sync) { if (epoch == _generation) { _diagnostics = _diagnostics with { Transport = null, Warnings = [] }; _warnings.Clear(); _deviceVolume = new(); _volumeEdit?.Cancel(); _localVolume = null; _localVolumeAvailable = false; _snapshot = _snapshot with { Metrics = null }; } }
                     Publish(epoch, PlaybackState.Connecting, attempts > 0 ? L.Format("Reconnecting ({0}/{1})", attempts, settings.MaxReconnectAttempts) : L.Get("Connecting…"));
                     var deadline = DateTime.UtcNow + _timing.Connect;
                     await _equalizerWriter.WaitAsync(cancellation).ConfigureAwait(false);
@@ -396,6 +422,21 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                         else if (kind == "device_volume_error" && startedAt != 0)
                         {
                             log?.Invoke($"Device volume rejected: {item.Text("message")}");
+                        }
+                        else if (kind is "local_monitor" or "local_volume_changed")
+                        {
+                            // The engine reports the endpoint volume it read, then echoes each write.
+                            lock (_sync)
+                            {
+                                if (epoch != _generation) continue;
+                                _localVolume = item.Integer("volume") is { } reported ? (int)reported : null;
+                                _localVolumeAvailable = (kind == "local_monitor" ? item.Boolean("volume_available") : item.Boolean("available")) != false;
+                            }
+                            PublishCurrent(epoch);
+                        }
+                        else if (kind == "local_volume_error")
+                        {
+                            log?.Invoke($"Local volume rejected: {item.Text("message")}");
                         }
                         else if (kind == "warning" && startedAt != 0)
                         {
@@ -526,7 +567,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         lock (_sync)
         {
             if (epoch != _generation) return;
-            snapshot = new(state, _receiver, message, metrics ?? _snapshot.Metrics, _receiver is null ? 0 : _settings.Latency(_receiver.Id), _diagnostics, int.TryParse(_settings.StreamSampleRate, out var streamRate) ? streamRate : 0, _deviceVolume, _autoAlignmentDelay);
+            snapshot = new(state, _receiver, message, metrics ?? _snapshot.Metrics, _receiver is null ? 0 : _settings.Latency(_receiver.Id), _diagnostics, int.TryParse(_settings.StreamSampleRate, out var streamRate) ? streamRate : 0, _deviceVolume, _autoAlignmentDelay, _localVolume, _localVolumeAvailable);
             _snapshot = snapshot;
         }
         Changed?.Invoke(snapshot);

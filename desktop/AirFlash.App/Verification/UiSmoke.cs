@@ -127,10 +127,8 @@ internal static class UiSmoke
             CheckPanelIcons(panel, app, checks);
             await Until(() => app.DeviceVolumes.Count == 2);
             Check(app.DeviceVolumes.Select(d => d.Host).SequenceEqual(new[] { "127.0.0.2", "127.0.0.3" }), "each device of the session reports its own volume row", checks);
-            Check(!app.DeviceVolumesExpanded && app.HasPerDeviceVolumes, "the sub-entry stays closed until it is opened", checks);
+            Check(app.DeviceVolumesExpanded && app.HasPerDeviceVolumes, "the device rows start open beside the master volume", checks);
             var expandButton = Descendants(panel).OfType<Button>().Single(b => System.Windows.Automation.AutomationProperties.GetName(b) == L.Get("Per-device volume"));
-            Invoke(expandButton); await Pump();
-            Check(app.DeviceVolumesExpanded, "the sub-entry expands beside the master volume", checks);
             var rightSlider = Descendants(panel).OfType<Slider>().Single(s => System.Windows.Automation.AutomationProperties.GetName(s) == "右侧");
             Check(rightSlider.IsEnabled && app.DeviceVolumes[0].Volume == 28 && app.DeviceVolumes[1].Volume == 28, "each device slider reports its own volume", checks);
             var volumeWrites = engine.Commands.Count(c => c.Text("command") == "set_device_volume");
@@ -146,6 +144,8 @@ internal static class UiSmoke
             Check(app.DeviceVolumes[1].VolumeStatus.Length == 0 && app.DeviceVolumes[1].VolumeText == "44%", "the targeted device confirms its new volume", checks);
             Invoke(expandButton); await Pump();
             Check(!app.DeviceVolumesExpanded, "the sub-entry collapses again", checks);
+            Invoke(expandButton); await Pump();
+            Check(app.DeviceVolumesExpanded, "the sub-entry opens again", checks);
             Invoke(stereoButton); await Until(() => app.Snapshot.State == PlaybackState.Idle && app.DeviceVolumes.Count == 0);
             Check(!app.HasPerDeviceVolumes, "stopping the session removes the per-device rows", checks);
             Invoke(playbackButton); await Until(() => app.Snapshot.State == PlaybackState.Streaming);
@@ -195,6 +195,15 @@ internal static class UiSmoke
             Check(aligned.GetProperty("params").GetProperty("peers")[0].Text("channel") == ChannelOptions.Left, "receiver channel reaches the engine", checks);
             var monitorWire = aligned.GetProperty("params").GetProperty("local_monitor");
             Check(monitorWire.Text("channel") == ChannelOptions.Right && monitorWire.Boolean("auto_delay") == true, "local channel and automatic delay reach the engine", checks);
+            // Local speaker volume: the engine reports the endpoint level and echoes every write.
+            await Until(() => app.LocalVolumeAvailable && app.LocalVolume == 65);
+            var localSlider = Descendants(panel).OfType<Slider>().Single(s => System.Windows.Automation.AutomationProperties.GetName(s) == L.Get("Local speaker"));
+            Check(localSlider.IsEnabled && app.LocalVolumeText == "65%", "the local speaker reports the endpoint volume", checks);
+            var localWrites = engine.Commands.Count(c => c.Text("command") == "set_local_volume");
+            localSlider.Value = 30; await Pump();
+            await Until(() => engine.Commands.Where(c => c.Text("command") == "set_local_volume").Skip(localWrites).Any(c => c.GetProperty("params").Number("volume") == 30));
+            await Until(() => app.LocalVolume == 30 && app.LocalVolumeText == "30%");
+            Check(app.MasterVolume == 25, "a local speaker edit leaves the master volume alone", checks);
             // A split that leaves one output on both channels fails with the outputs to fix.
             settings.ViewModel.Draft.LocalPlaybackChannel = ChannelOptions.Both;
             Invoke(settings.ApplyButton); await Until(() => !settings.ViewModel.HasChanges && app.Snapshot.State == PlaybackState.Error);
@@ -568,6 +577,7 @@ internal static class UiSmoke
         private CancellationTokenSource? _metrics;
         private string[] _hosts = [];
         private Dictionary<string, int> _volumes = [];
+        private int _localVolume = 65;
         private void EmitVolume(string session, string[] hosts, string status, long? sequence) =>
             Emit(session, new
             {
@@ -584,6 +594,8 @@ internal static class UiSmoke
                 _volumes = _hosts.ToDictionary(h => h, _ => 28);
                 Emit(session, new { @event = "streaming" });
                 EmitVolume(session, [], "confirmed", 0);
+                if (JsonSerializer.SerializeToElement(parameters).TryGetProperty("local_monitor", out var monitor) && monitor.ValueKind == JsonValueKind.Object)
+                    Emit(session, new { @event = "local_monitor", endpoint = monitor.Text("endpoint"), delay_ms = 120, volume = _localVolume, volume_available = true });
                 _metrics = new(); var token = _metrics.Token;
                 _ = Task.Run(async () => { try { while (!token.IsCancellationRequested) { Emit(session, new { @event = "capture_metrics", metrics = new { capture_to_send_p95_ms = 10.8, max_queue_age_ms = 11.8, underrun_packets = 0, dropped_frames = 0, input_rate = 48000 } }); Emit(session, new { @event = "transport_metrics", session_uptime_ms = 123456, sender_late_recoveries = 2, skipped_packets = 10, members = new[] { new { host = "192.0.2.1", media = new { packets_sent = 12000, media_send_errors = 1, sync_send_errors = 0, retransmit_requests = 6, retransmits_sent = 5, retransmit_missing = 0, retransmit_expired = 1, retransmit_queue_drops = 0, retransmit_send_errors = 0, receiver_latency_ms = 150, receiver_latency_estimated = true }, health = new { feedback_rtt_ms = 4.2, feedback_failures = 0, feedback_delayed = false } } } }); await Task.Delay(350, token); } } catch (OperationCanceledException) { } }, CancellationToken.None);
             }
@@ -599,6 +611,11 @@ internal static class UiSmoke
                     foreach (var target in targets) _volumes[target] = value;
                     EmitVolume(session, targets, "confirmed", sequence);
                 });
+            }
+            if (command == "set_local_volume")
+            {
+                _localVolume = (int)JsonSerializer.SerializeToElement(parameters).Number("volume")!;
+                Emit(session, new { @event = "local_volume_changed", volume = _localVolume, available = true });
             }
             if (command == "stop") _events.Writer.TryComplete();
             return Task.CompletedTask;

@@ -62,14 +62,22 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     public string MonitorLastFault => _snapshot.Diagnostics?.LastFault?.Detail ?? "—";
     public ObservableCollection<TransportMemberViewModel> MonitorMembers { get; } = [];
     public ObservableCollection<DeviceVolumeViewModel> DeviceVolumes { get; } = [];
-    private bool _deviceVolumesExpanded;
+    private bool _deviceVolumesExpanded = true;
     public bool DeviceVolumesExpanded
     {
         get => _deviceVolumesExpanded;
         set { _deviceVolumesExpanded = value; Notify(); Notify(nameof(PerDeviceVolumesVisible)); }
     }
-    /// A session with two or more physical devices offers one slider per device.
-    public bool HasPerDeviceVolumes => DeviceVolumes.Count > 1;
+    /// Volume of the local output device, reported by the engine while local playback runs.
+    public int LocalVolume
+    {
+        get => _snapshot.LocalVolume ?? 0;
+        set { if (LocalVolume == value || !LocalVolumeAvailable) return; _ = Session.SetLocalVolumeAsync(value); Notify(); }
+    }
+    public bool LocalVolumeAvailable => _snapshot.LocalVolumeAvailable && _snapshot.LocalVolume is not null;
+    public string LocalVolumeText => _snapshot.LocalVolume is { } value ? $"{value}%" : "—";
+    /// Any session that plays somewhere offers a slider per output.
+    public bool HasPerDeviceVolumes => DeviceVolumes.Count > 0 || LocalVolumeAvailable;
     public bool PerDeviceVolumesVisible => HasPerDeviceVolumes && DeviceVolumesExpanded;
     public RelayCommand ToggleDeviceVolumesCommand { get; }
     public string MonitorBeforeFault
@@ -328,6 +336,8 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         if (_closing || !ReferenceEquals(snapshot, Session.Snapshot)) return;
         var title = StatusTitle; var detail = StatusDetail; var errors = ErrorDetails;
         var previous = _snapshot;
+        // Visibility depends on the local speaker too, so compare before the snapshot moves.
+        var hadPerDeviceVolumes = HasPerDeviceVolumes;
         _snapshot = snapshot;
         Notify(nameof(Snapshot));
         if (title != StatusTitle) Notify(nameof(StatusTitle));
@@ -339,17 +349,17 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
             StopCommand.Refresh();
         }
         foreach (var row in Receivers) row.Refresh();
-        RefreshDeviceVolumes();
+        Notify(nameof(LocalVolume)); Notify(nameof(LocalVolumeAvailable)); Notify(nameof(LocalVolumeText));
+        RefreshDeviceVolumes(hadPerDeviceVolumes);
         if (_monitorVisible) RefreshMonitor();
     });
     // One row per physical device of the active session, ordered with the leader first.
-    private void RefreshDeviceVolumes()
+    private void RefreshDeviceVolumes(bool hadPerDeviceVolumes)
     {
         var active = _snapshot;
         var streaming = active.State is PlaybackState.Streaming or PlaybackState.Standby;
         var members = streaming ? active.DeviceVolume?.Members ?? [] : [];
         var peers = streaming ? active.Receiver?.Peers.ToArray() ?? [] : [];
-        var hadPerDeviceVolumes = HasPerDeviceVolumes;
         foreach (var row in DeviceVolumes.Where(r => members.All(m => m.Host != r.Host)).ToArray()) DeviceVolumes.Remove(row);
         for (var i = 0; i < members.Count; i++)
         {
@@ -364,14 +374,13 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
             }
             row.Update(member);
         }
-        // The sub-entry only exists for a multi-device session; HasPerDeviceVolumes derives from the
+        // The rows only exist while an output is playing; HasPerDeviceVolumes derives from the
         // collection, so the flip has to be detected against the state before the rows were synced.
         if (hadPerDeviceVolumes != HasPerDeviceVolumes)
         {
             Notify(nameof(HasPerDeviceVolumes));
             Notify(nameof(PerDeviceVolumesVisible));
             ToggleDeviceVolumesCommand.Refresh();
-            if (DeviceVolumesExpanded && !HasPerDeviceVolumes) DeviceVolumesExpanded = false;
         }
     }
     public void SetMonitorVisible(bool visible)

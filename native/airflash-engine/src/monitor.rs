@@ -22,7 +22,7 @@ use std::{
 use windows::{
     Win32::{
         Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0},
-        Media::Audio::*,
+        Media::Audio::{Endpoints::IAudioEndpointVolume, *},
         System::{Com::*, Threading::*},
     },
 };
@@ -57,6 +57,48 @@ impl Delay {
 impl Default for Delay {
     fn default() -> Self {
         Self::new(0)
+    }
+}
+/// Volume of the local output endpoint, mirrored from the Windows volume control
+/// so the host can balance the speakers against the AirPlay receivers.
+#[derive(Clone, Default)]
+pub struct LocalVolume {
+    /// Requested percent plus one; zero means nothing is pending.
+    requested: Arc<AtomicU32>,
+    /// Percent last read from or written to the endpoint, plus one; zero is unknown.
+    applied: Arc<AtomicU32>,
+    available: Arc<AtomicBool>,
+}
+impl LocalVolume {
+    /// Ask the monitor thread to apply `percent` to the endpoint.
+    pub fn set(&self, percent: u8) {
+        self.requested
+            .store(u32::from(percent.min(100)) + 1, Ordering::Release);
+    }
+    /// Percent reported by the endpoint, when it was readable.
+    pub fn volume(&self) -> Option<u8> {
+        match self.applied.load(Ordering::Acquire) {
+            0 => None,
+            value => Some((value - 1) as u8),
+        }
+    }
+    /// Whether the endpoint exposes a volume control at all.
+    pub fn available(&self) -> bool {
+        self.available.load(Ordering::Acquire)
+    }
+    fn publish(&self, percent: u8) {
+        self.applied
+            .store(u32::from(percent) + 1, Ordering::Release);
+        self.available.store(true, Ordering::Release);
+    }
+    fn pending(&self) -> Option<u8> {
+        match self.requested.load(Ordering::Acquire) {
+            0 => None,
+            value => Some((value - 1) as u8),
+        }
+    }
+    fn settle(&self) {
+        self.requested.store(0, Ordering::Release);
     }
 }
 /// Interleaved stereo delay line. The line keeps `target` frames buffered, so
@@ -125,13 +167,14 @@ impl Drop for EventGuard {
 pub struct Monitor {
     shared: Arc<Mutex<Shared>>,
     delay: Delay,
+    volume: LocalVolume,
     limit: usize,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<Result<()>>>,
 }
 impl Monitor {
     /// Render the streamed audio on `endpoint` (default render device when unset).
-    pub fn start(endpoint: Option<String>, rate: u32, delay: Delay) -> Result<Self> {
+    pub fn start(endpoint: Option<String>, rate: u32, delay: Delay, volume: LocalVolume) -> Result<Self> {
         ensure!(
             (8000..=192_000).contains(&rate),
             "unsupported monitor sample rate"
@@ -140,18 +183,18 @@ impl Monitor {
         let shared = Arc::new(Mutex::new(Shared { line: DelayLine::default() }));
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::sync_channel(1);
-        let (worker_stop, worker_shared, worker_delay) = (stop.clone(), shared.clone(), delay.clone());
+        let (worker_stop, worker_shared, worker_delay, worker_volume) = (stop.clone(), shared.clone(), delay.clone(), volume.clone());
         let worker = thread::Builder::new()
             .name("wasapi-monitor".into())
             .spawn(move || {
-                let result = render(endpoint, rate, worker_delay, worker_stop, &worker_shared, &tx);
+                let result = render(endpoint, rate, worker_delay, worker_stop, &worker_shared, &worker_volume, &tx);
                 if let Err(e) = &result {
                     let _ = tx.try_send(Err(format!("{e:#}")));
                 }
                 result
             })?;
         match rx.recv_timeout(Duration::from_secs(3)) {
-            Ok(Ok(())) => Ok(Self { shared, delay, limit, stop, worker: Some(worker) }),
+            Ok(Ok(())) => Ok(Self { shared, delay, volume, limit, stop, worker: Some(worker) }),
             other => {
                 stop.store(true, Ordering::Release);
                 let _ = worker.join();
@@ -176,6 +219,10 @@ impl Monitor {
     pub fn dropped_frames(&self) -> u64 {
         self.shared.lock().unwrap().line.dropped_frames
     }
+    /// Shared endpoint volume of the local output device.
+    pub fn local_volume(&self) -> LocalVolume {
+        self.volume.clone()
+    }
 }
 impl Drop for Monitor {
     fn drop(&mut self) {
@@ -191,6 +238,7 @@ fn render(
     delay: Delay,
     stop: Arc<AtomicBool>,
     shared: &Arc<Mutex<Shared>>,
+    volume: &LocalVolume,
     ready: &mpsc::SyncSender<std::result::Result<(), String>>,
 ) -> Result<()> {
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok() }?;
@@ -199,6 +247,14 @@ fn render(
     let enumerator: IMMDeviceEnumerator =
         unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }?;
     let device = crate::wasapi::find_device(&enumerator, endpoint.as_deref())?;
+    // The endpoint's own volume control keeps the speakers in step with the Windows mixer.
+    let endpoint_volume: Option<IAudioEndpointVolume> =
+        unsafe { device.Activate(CLSCTX_ALL, None) }.ok();
+    if let Some(control) = &endpoint_volume {
+        if let Ok(level) = unsafe { control.GetMasterVolumeLevelScalar() } {
+            volume.publish((level * 100.0).round().clamp(0.0, 100.0) as u8);
+        }
+    }
     let client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None) }?;
     let format = WAVEFORMATEX {
         wFormatTag: IEEE_FLOAT,
@@ -233,6 +289,12 @@ fn render(
         if unsafe { WaitForSingleObject(event.0, 50) } != WAIT_OBJECT_0 {
             continue;
         }
+        if let (Some(control), Some(percent)) = (&endpoint_volume, volume.pending()) {
+            if unsafe { control.SetMasterVolumeLevelScalar(f32::from(percent) / 100.0, std::ptr::null()) }.is_ok() {
+                volume.publish(percent);
+            }
+            volume.settle();
+        }
         let padding = unsafe { client.GetCurrentPadding() }? as usize;
         let available = buffer_frames.saturating_sub(padding);
         if available == 0 {
@@ -264,6 +326,20 @@ mod tests {
         let mut line = DelayLine::default();
         line.push(samples, 44100 * 3 * CHANNELS);
         line
+    }
+    #[test]
+    fn local_volume_reports_unknown_until_the_endpoint_answers() {
+        let volume = LocalVolume::default();
+        assert_eq!(volume.volume(), None);
+        assert!(!volume.available());
+        assert_eq!(volume.pending(), None);
+        volume.set(140);
+        assert_eq!(volume.pending(), Some(100), "host values are clamped to 100");
+        volume.settle();
+        assert_eq!(volume.pending(), None);
+        volume.publish(0);
+        assert_eq!(volume.volume(), Some(0), "zero is a real volume, not an unknown one");
+        assert!(volume.available());
     }
     #[test]
     fn delay_is_clamped_and_converted_to_frames() {

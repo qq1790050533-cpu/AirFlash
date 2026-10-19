@@ -46,6 +46,8 @@ struct Running {
     hosts: Vec<String>,
     equalizer: Option<(airflash_engine::equalizer::Control, u32)>,
     monitor_delay: Delay,
+    /// Volume of the local output device, shared with the monitor thread.
+    local_volume: airflash_engine::monitor::LocalVolume,
 }
 impl Drop for Running {
     fn drop(&mut self) {
@@ -116,7 +118,7 @@ fn main() {
             "hello" => send(
                 &request.id,
                 &request.session_id,
-                json!({"event":"hello","engine_version":env!("CARGO_PKG_VERSION"),"mode":"native","qualification":"partial","live_loopback":true,"commands":["hello","start","probe","stop","set_gain","set_equalizer","set_device_volume","set_local_monitor","pair","pair_pin"],"production_ready":false}),
+                json!({"event":"hello","engine_version":env!("CARGO_PKG_VERSION"),"mode":"native","qualification":"partial","live_loopback":true,"commands":["hello","start","probe","stop","set_gain","set_equalizer","set_device_volume","set_local_monitor","set_local_volume","pair","pair_pin"],"production_ready":false}),
             ),
             "probe" | "start" => {
                 let options: ProbeOptions = match serde_json::from_value(request.params) {
@@ -163,9 +165,11 @@ fn main() {
                     options.local_monitor.as_ref().map_or(0, |m| m.delay_ms),
                 );
                 let worker_monitor_delay = monitor_delay.clone();
+                let local_volume = airflash_engine::monitor::LocalVolume::default();
+                let worker_local_volume = local_volume.clone();
                 let worker = thread::spawn(move || {
                     let emit = |e| send(&request.id, &request.session_id, e);
-                    if let Err(error) = probe_with_monitor(options, worker_cancel, worker_gain, worker_volume, worker_equalizer, worker_monitor_delay, emit) {
+                    if let Err(error) = probe_with_monitor(options, worker_cancel, worker_gain, worker_volume, worker_equalizer, worker_monitor_delay, worker_local_volume, emit) {
                         emit(airflash_engine::transport::error_event(&error));
                     }
                 });
@@ -180,6 +184,7 @@ fn main() {
                     hosts,
                     equalizer: live_equalizer,
                     monitor_delay,
+                    local_volume,
                 });
             }
             "set_device_volume" => {
@@ -338,6 +343,7 @@ fn main() {
                     hosts: Vec::new(),
                     equalizer: None,
                     monitor_delay: Delay::default(),
+                    local_volume: airflash_engine::monitor::LocalVolume::default(),
                 });
             }
             "set_local_monitor" => {
@@ -363,6 +369,33 @@ fn main() {
                         &request.id,
                         &request.session_id,
                         json!({"event":"error","message":"local monitor delay must be 0..2000 ms with an active session"}),
+                    ),
+                }
+            }
+            "set_local_volume" => {
+                let volume = request
+                    .params
+                    .get("volume")
+                    .and_then(Value::as_u64)
+                    .filter(|v| *v <= 100);
+                match running
+                    .as_ref()
+                    .filter(|r| r.id == request.session_id)
+                    .zip(volume)
+                {
+                    Some((r, percent)) => {
+                        // The monitor thread applies it to the endpoint on its next wake-up.
+                        r.local_volume.set(percent as u8);
+                        send(
+                            &request.id,
+                            &request.session_id,
+                            json!({"event":"local_volume_changed","volume":percent,"available":true}),
+                        );
+                    }
+                    None => send(
+                        &request.id,
+                        &request.session_id,
+                        json!({"event":"local_volume_error","message":"local volume needs an active session with local playback"}),
                     ),
                 }
             }

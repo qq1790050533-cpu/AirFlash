@@ -481,6 +481,29 @@ public sealed class SessionTests
         Assert.Equal("confirmed", controller.Snapshot.DeviceVolume.Status);
         Assert.True(controller.Snapshot.DeviceVolume.Available);
     }
+    [Fact]
+    public async Task LocalVolumeMirrorsTheEndpointAndWritesThroughTheEngine()
+    {
+        var process = new FakeConnection(); await using var controller = new SessionController(new FakeFactory(process), new FakeAudio(), timing: Fast);
+        await controller.StartAsync(Pod("a"), Settings()); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        // Without a reported endpoint there is no device volume to write.
+        await controller.SetLocalVolumeAsync(40);
+        await Task.Delay(250);
+        Assert.DoesNotContain(process.Commands, c => c.Command == "set_local_volume");
+        Assert.False(controller.Snapshot.LocalVolumeAvailable);
+        process.EmitData(new { @event = "local_monitor", endpoint = "endpoint-a", delay_ms = 120, volume = 65, volume_available = true });
+        await Until(() => controller.Snapshot.LocalVolumeAvailable);
+        Assert.Equal(65, controller.Snapshot.LocalVolume);
+        await controller.SetLocalVolumeAsync(30);
+        await Until(() => process.Commands.Any(c => c.Command == "set_local_volume"));
+        Assert.Equal(30, Assert.Single(process.Commands, c => c.Command == "set_local_volume").Parameters.Number("volume"));
+        process.EmitData(new { @event = "local_volume_changed", volume = 30, available = true });
+        await Until(() => controller.Snapshot.LocalVolume == 30);
+        // Stopping the session forgets the endpoint, so a stale slider cannot write into the next one.
+        await controller.StopAsync();
+        Assert.Null(controller.Snapshot.LocalVolume);
+        Assert.False(controller.Snapshot.LocalVolumeAvailable);
+    }
     private sealed class FakeFactory(params FakeConnection[] processes) : IEngineFactory
     {
         private readonly ConcurrentQueue<FakeConnection> _processes = new(processes);

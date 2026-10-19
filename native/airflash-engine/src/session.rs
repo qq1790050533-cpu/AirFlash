@@ -600,6 +600,7 @@ pub fn probe_with_controls(
         volume,
         equalizer,
         crate::monitor::Delay::default(),
+        crate::monitor::LocalVolume::default(),
         emit,
     )
 }
@@ -611,6 +612,7 @@ pub fn probe_with_monitor(
     volume: crate::volume::Control,
     equalizer: crate::equalizer::Control,
     monitor_delay: crate::monitor::Delay,
+    local_volume: crate::monitor::LocalVolume,
     emit: impl Fn(Json),
 ) -> Result<()> {
     if options.duration_ms == 0 {
@@ -702,10 +704,11 @@ pub fn probe_with_monitor(
                 spec.endpoint.clone(),
                 rate,
                 monitor_delay,
+                local_volume.clone(),
             )
             .context("local monitor")?;
             emit(
-                json!({"event":"local_monitor","endpoint":spec.endpoint,"delay_ms":monitor.delay_ms(),"auto_delay":spec.auto_delay,"channel":spec.channel,"receiver_latency_ms":members.iter().map(|m|m.media.latency_ms()).collect::<Vec<_>>(),"sample_rate":rate}),
+                json!({"event":"local_monitor","endpoint":spec.endpoint,"delay_ms":monitor.delay_ms(),"auto_delay":spec.auto_delay,"channel":spec.channel,"receiver_latency_ms":members.iter().map(|m|m.media.latency_ms()).collect::<Vec<_>>(),"sample_rate":rate,"volume":local_volume.volume(),"volume_available":local_volume.available()}),
             );
             Some(monitor)
         }
