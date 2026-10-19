@@ -32,4 +32,5 @@ public static class Choices
     public static Choice[] Latencies => [new("realtime", L.Get("Real-time · 120 ms")), new("normal", L.Get("Normal · 200 ms")), new("buffered", L.Get("Buffered · 500 ms")), new("custom", L.Get("Custom"))];
     public static Choice[] ReceiverLatencies => [new(null, L.Get("Use global setting")), .. Latencies];
     public static Choice[] AutoConnect => [new(null, L.Get("Use global setting")), new(true, L.Get("On")), new(false, L.Get("Off"))];
+    public static Choice[] Channels => [new(ChannelOptions.Both, L.Get("Both channels")), new(ChannelOptions.Left, L.Get("Left channel only")), new(ChannelOptions.Right, L.Get("Right channel only"))];
 }

@@ -4,12 +4,30 @@ using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 namespace AirFlash.Core;
 
+/// <summary>Channel assignment for one output: a split layout pairs a left and a right device.</summary>
+public static class ChannelOptions
+{
+    public const string Both = "both";
+    public const string Left = "left";
+    public const string Right = "right";
+    public static readonly string[] All = [Both, Left, Right];
+    public static bool IsSplit(string? channel) => channel is Left or Right;
+    /// Unknown or missing values fall back to both channels.
+    public static string Normalize(string? channel) => All.Contains(channel) ? channel! : Both;
+    /// A split layout must cover every output: exactly one left and one right, nothing playing both.
+    public static bool IsValidSplit(IReadOnlyList<string> channels) => channels.Count > 0
+        && channels.All(IsSplit)
+        && channels.Count(c => c == Left) == 1
+        && channels.Count(c => c == Right) == 1;
+}
+
 public sealed class ReceiverOptions : ObservableObject
 {
     public void CopyFrom(ReceiverOptions source)
     {
         AutoConnect = source.AutoConnect; Hidden = source.Hidden; Volume = source.Volume;
         LatencyMode = source.LatencyMode; CustomBufferMs = source.CustomBufferMs; StandbySeconds = source.StandbySeconds;
+        Channel = source.Channel;
     }
     private bool? _AutoConnect = null;
     public bool? AutoConnect { get => _AutoConnect; set => Set(ref _AutoConnect, value); }
@@ -23,6 +41,8 @@ public sealed class ReceiverOptions : ObservableObject
     public int? CustomBufferMs { get => _CustomBufferMs; set => Set(ref _CustomBufferMs, value); }
     private double? _StandbySeconds = null;
     public double? StandbySeconds { get => _StandbySeconds; set => Set(ref _StandbySeconds, value); }
+    private string _Channel = ChannelOptions.Both;
+    public string Channel { get => _Channel; set => Set(ref _Channel, ChannelOptions.Normalize(value)); }
 }
 public sealed record ManualReceiver(string Id, string Name, string Host, int Port);
 public sealed class AppSettings : ObservableObject
@@ -65,6 +85,16 @@ public sealed class AppSettings : ObservableObject
     private string? _CaptureEndpoint = null;
     public string? CaptureEndpoint { get => _CaptureEndpoint; set => Set(ref _CaptureEndpoint, value); }
     public void RefreshCaptureEndpoint() => Notify(nameof(CaptureEndpoint));
+    private bool _LocalPlaybackEnabled = false;
+    public bool LocalPlaybackEnabled { get => _LocalPlaybackEnabled; set => Set(ref _LocalPlaybackEnabled, value); }
+    private string? _LocalPlaybackEndpoint = null;
+    public string? LocalPlaybackEndpoint { get => _LocalPlaybackEndpoint; set => Set(ref _LocalPlaybackEndpoint, value); }
+    private int _LocalPlaybackDelayMs = 0;
+    public int LocalPlaybackDelayMs { get => _LocalPlaybackDelayMs; set => Set(ref _LocalPlaybackDelayMs, value); }
+    private string _LocalPlaybackChannel = ChannelOptions.Both;
+    public string LocalPlaybackChannel { get => _LocalPlaybackChannel; set => Set(ref _LocalPlaybackChannel, ChannelOptions.Normalize(value)); }
+    private bool _LocalPlaybackAutoDelay = false;
+    public bool LocalPlaybackAutoDelay { get => _LocalPlaybackAutoDelay; set => Set(ref _LocalPlaybackAutoDelay, value); }
     private int _MasterVolume = 100;
     public int MasterVolume { get => _MasterVolume; set => Set(ref _MasterVolume, value); }
     public string? LastReceiverId { get; set; }
@@ -85,6 +115,9 @@ public sealed class AppSettings : ObservableObject
     }
     public double Gain(string id) => Math.Clamp(MasterVolume, 0, 100) / 100d;
     public string? EffectiveEndpoint => CaptureMode == "loopback" ? null : CaptureEndpoint;
+    /// Local playback mirrors the streamed audio after this delay so both paths align.
+    public const int MaxLocalPlaybackDelayMs = 2000;
+    public int LocalPlaybackDelay => Math.Clamp(LocalPlaybackDelayMs, 0, MaxLocalPlaybackDelayMs);
     public string? Validate()
     {
         if (UiLanguage is not ("system" or "en" or "zh")) return L.Get("Select a valid language.");
@@ -99,6 +132,12 @@ public sealed class AppSettings : ObservableObject
         if (!double.IsFinite(StandbySilenceSeconds) || StandbySilenceSeconds is < 5 or > 300) return L.Get("Standby threshold must be between 5 and 300 seconds.");
         if (CaptureMode is not ("loopback" or "endpoint")) return L.Get("Select a valid capture mode.");
         if (CaptureMode == "endpoint" && string.IsNullOrWhiteSpace(CaptureEndpoint)) return L.Get("Select a capture endpoint.");
+        if (LocalPlaybackDelayMs is < 0 or > MaxLocalPlaybackDelayMs) return L.Format("Local playback delay must be between 0 and {0} ms.", MaxLocalPlaybackDelayMs);
+        if (LocalPlaybackEnabled)
+        {
+            if (string.IsNullOrWhiteSpace(LocalPlaybackEndpoint)) return L.Get("Select a local playback device for aligned playback.");
+            if (string.Equals(LocalPlaybackEndpoint, EffectiveEndpoint, StringComparison.Ordinal)) return L.Get("The local playback device must differ from the capture endpoint.");
+        }
         foreach (var options in Receivers.Values)
         {
             if (options.Volume is < 0 or > 100) return L.Get("Device volume must be between 0 and 100.");
@@ -121,6 +160,9 @@ public sealed class AppSettings : ObservableObject
         LatencyMode = source.LatencyMode; CustomBufferMs = source.CustomBufferMs;
         StandbyEnabled = source.StandbyEnabled; StandbySilenceSeconds = source.StandbySilenceSeconds;
         CaptureMode = source.CaptureMode; CaptureEndpoint = source.CaptureEndpoint;
+        LocalPlaybackEnabled = source.LocalPlaybackEnabled; LocalPlaybackEndpoint = source.LocalPlaybackEndpoint;
+        LocalPlaybackDelayMs = source.LocalPlaybackDelayMs; LocalPlaybackChannel = source.LocalPlaybackChannel;
+        LocalPlaybackAutoDelay = source.LocalPlaybackAutoDelay;
         MasterVolume = source.MasterVolume; LastReceiverId = source.LastReceiverId;
         Extra = source.Extra?.ToDictionary(p => p.Key, p => p.Value.Clone());
         ReceiverAliases = new(source.ReceiverAliases, StringComparer.Ordinal);

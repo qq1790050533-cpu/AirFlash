@@ -212,5 +212,57 @@ public sealed class SettingsTests
         }
         finally { Directory.Delete(directory, true); }
     }
+    [Fact]
+    public void LocalAlignmentRequiresADeviceDifferentFromTheCaptureEndpoint()
+    {
+        var settings = new AppSettings();
+        Assert.False(settings.LocalPlaybackEnabled);
+        Assert.Equal(0, settings.LocalPlaybackDelay);
+        Assert.Null(settings.Validate());
+        settings.LocalPlaybackEnabled = true;
+        Assert.Equal(L.Get("Select a local playback device for aligned playback."), settings.Validate());
+        settings.LocalPlaybackEndpoint = "speakers";
+        Assert.Null(settings.Validate());
+        settings.CaptureMode = "endpoint"; settings.CaptureEndpoint = "speakers";
+        Assert.Equal(L.Get("The local playback device must differ from the capture endpoint."), settings.Validate());
+        settings.CaptureEndpoint = "cable-output";
+        Assert.Null(settings.Validate());
+        settings.LocalPlaybackDelayMs = 2500;
+        Assert.Equal(L.Format("Local playback delay must be between 0 and {0} ms.", AppSettings.MaxLocalPlaybackDelayMs), settings.Validate());
+        settings.LocalPlaybackDelayMs = 180;
+        Assert.Equal(180, settings.LocalPlaybackDelay);
+        Assert.Equal(180, settings.Clone().LocalPlaybackDelayMs);
+    }
+    [Fact]
+    public void ChannelAssignmentsDefaultToBothAndRoundTrip()
+    {
+        var settings = new AppSettings();
+        Assert.Equal(ChannelOptions.Both, settings.LocalPlaybackChannel);
+        Assert.False(settings.LocalPlaybackAutoDelay);
+        settings.LocalPlaybackChannel = "left"; settings.LocalPlaybackAutoDelay = true;
+        settings.Options("a").Channel = "right"; settings.Options("b").Channel = "nowhere";
+        var clone = settings.Clone();
+        Assert.Equal("left", clone.LocalPlaybackChannel); Assert.True(clone.LocalPlaybackAutoDelay);
+        Assert.Equal("right", clone.Options("a").Channel);
+        // An unknown channel value falls back to both channels instead of throwing.
+        Assert.Equal(ChannelOptions.Both, clone.Options("b").Channel);
+        var migrated = new AppSettings { Receivers = { ["x"] = new ReceiverOptions { Channel = ChannelOptions.Left } } };
+        ReceiverCatalog.ApplyMigrations(migrated, new Dictionary<string, string> { ["x"] = "y" });
+        Assert.Equal(ChannelOptions.Left, migrated.Options("y").Channel);
+        Assert.False(migrated.Receivers.ContainsKey("x"));
+    }
+    [Fact]
+    public void ChannelSplitLayoutsCoverEveryOutputExactlyOnce()
+    {
+        Assert.False(ChannelOptions.IsSplit("both")); Assert.True(ChannelOptions.IsSplit("left")); Assert.True(ChannelOptions.IsSplit("right"));
+        Assert.Equal(ChannelOptions.Both, ChannelOptions.Normalize("nowhere")); Assert.Equal(ChannelOptions.Right, ChannelOptions.Normalize("right"));
+        Assert.True(ChannelOptions.IsValidSplit([ChannelOptions.Left, ChannelOptions.Right]));
+        Assert.True(ChannelOptions.IsValidSplit([ChannelOptions.Right, ChannelOptions.Left]));
+        Assert.False(ChannelOptions.IsValidSplit([ChannelOptions.Left]));
+        Assert.False(ChannelOptions.IsValidSplit([ChannelOptions.Left, ChannelOptions.Left]));
+        Assert.False(ChannelOptions.IsValidSplit([ChannelOptions.Left, ChannelOptions.Both, ChannelOptions.Right]));
+        Assert.False(ChannelOptions.IsValidSplit([ChannelOptions.Left, ChannelOptions.Right, ChannelOptions.Right]));
+        Assert.False(ChannelOptions.IsValidSplit([]));
+    }
     private static string NewDirectory() { var path = Path.Combine(Path.GetTempPath(), "airplay-tests", Guid.NewGuid().ToString("N")); Directory.CreateDirectory(path); return path; }
 }

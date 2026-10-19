@@ -1,7 +1,8 @@
 //! Versioned JSONL qualification interface. stdout is exclusively structured IPC.
 use airflash_engine::{
+    monitor::Delay,
     rtsp::Cancellation,
-    session::{ProbeOptions, probe_with_controls},
+    session::{ProbeOptions, probe_with_monitor},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -42,6 +43,7 @@ struct Running {
     gain_limit: f64,
     volume: airflash_engine::volume::Control,
     equalizer: Option<(airflash_engine::equalizer::Control, u32)>,
+    monitor_delay: Delay,
 }
 impl Drop for Running {
     fn drop(&mut self) {
@@ -112,7 +114,7 @@ fn main() {
             "hello" => send(
                 &request.id,
                 &request.session_id,
-                json!({"event":"hello","engine_version":env!("CARGO_PKG_VERSION"),"mode":"native","qualification":"partial","live_loopback":true,"commands":["hello","start","probe","stop","set_gain","set_equalizer","set_device_volume","pair","pair_pin"],"production_ready":false}),
+                json!({"event":"hello","engine_version":env!("CARGO_PKG_VERSION"),"mode":"native","qualification":"partial","live_loopback":true,"commands":["hello","start","probe","stop","set_gain","set_equalizer","set_device_volume","set_local_monitor","pair","pair_pin"],"production_ready":false}),
             ),
             "probe" | "start" => {
                 let options: ProbeOptions = match serde_json::from_value(request.params) {
@@ -154,9 +156,13 @@ fn main() {
                 let equalizer = airflash_engine::equalizer::Control::new(options.equalizer, rate).unwrap();
                 let worker_equalizer = equalizer.clone();
                 let live_equalizer = (request.command == "start").then_some((equalizer, rate));
+                let monitor_delay = Delay::new(
+                    options.local_monitor.as_ref().map_or(0, |m| m.delay_ms),
+                );
+                let worker_monitor_delay = monitor_delay.clone();
                 let worker = thread::spawn(move || {
                     let emit = |e| send(&request.id, &request.session_id, e);
-                    if let Err(error) = probe_with_controls(options, worker_cancel, worker_gain, worker_volume, worker_equalizer, emit) {
+                    if let Err(error) = probe_with_monitor(options, worker_cancel, worker_gain, worker_volume, worker_equalizer, worker_monitor_delay, emit) {
                         emit(airflash_engine::transport::error_event(&error));
                     }
                 });
@@ -169,6 +175,7 @@ fn main() {
                     gain_limit,
                     volume,
                     equalizer: live_equalizer,
+                    monitor_delay,
                 });
             }
             "set_device_volume" => {
@@ -319,7 +326,34 @@ fn main() {
                     gain_limit: 0.0,
                     volume: airflash_engine::volume::Control::default(),
                     equalizer: None,
+                    monitor_delay: Delay::default(),
                 });
+            }
+            "set_local_monitor" => {
+                let delay_ms = request
+                    .params
+                    .get("delay_ms")
+                    .and_then(Value::as_u64)
+                    .map(|ms| ms.min(airflash_engine::monitor::MAX_DELAY_MS as u64) as u32);
+                match running
+                    .as_ref()
+                    .filter(|r| r.id == request.session_id)
+                    .zip(delay_ms)
+                {
+                    Some((r, ms)) => {
+                        r.monitor_delay.set_ms(ms);
+                        send(
+                            &request.id,
+                            &request.session_id,
+                            json!({"event":"local_monitor_changed","delay_ms":ms}),
+                        );
+                    }
+                    None => send(
+                        &request.id,
+                        &request.session_id,
+                        json!({"event":"error","message":"local monitor delay must be 0..2000 ms with an active session"}),
+                    ),
+                }
             }
             "stop" => {
                 if running.as_ref().is_some_and(|r| r.id == request.session_id) {

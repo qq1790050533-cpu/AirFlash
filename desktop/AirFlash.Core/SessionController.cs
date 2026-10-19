@@ -6,7 +6,7 @@ namespace AirFlash.Core;
 
 public enum PlaybackState { Idle, Connecting, Streaming, Standby, Pairing, Error }
 public sealed record StreamMetrics(double? CaptureToSendP95 = null, double? MaxQueueAge = null, long? Underruns = null, long? DroppedFrames = null, int? InputRate = null);
-public sealed record SessionSnapshot(PlaybackState State, Receiver? Receiver = null, string Message = "", StreamMetrics? Metrics = null, int TargetLatency = 0, PlaybackDiagnostics? Diagnostics = null, int StreamRate = 0, DeviceVolumeState? DeviceVolume = null)
+public sealed record SessionSnapshot(PlaybackState State, Receiver? Receiver = null, string Message = "", StreamMetrics? Metrics = null, int TargetLatency = 0, PlaybackDiagnostics? Diagnostics = null, int StreamRate = 0, DeviceVolumeState? DeviceVolume = null, int? AutoAlignmentDelay = null)
 {
     public bool IsActive => State is PlaybackState.Connecting or PlaybackState.Streaming or PlaybackState.Standby or PlaybackState.Pairing;
 }
@@ -168,11 +168,27 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     }
     private PlaybackDiagnostics _diagnostics = new();
     private readonly Dictionary<string, EngineNotice> _warnings = [];
+    private int? _autoAlignmentDelay;
     private SessionSnapshot _snapshot = new(PlaybackState.Idle);
     public SessionSnapshot Snapshot { get { lock (_sync) return _snapshot; } }
     public event Action<SessionSnapshot>? Changed;
     public bool Muted => _muted;
-    private string Signature(Receiver receiver, AppSettings settings) => $"{receiver.TransportKey}|{settings.EffectiveEndpoint}|{settings.Latency(receiver.Id)}|{settings.StreamSampleRate}";
+    // The alignment delay is applied live, so it never restarts a session; channel assignments do.
+    private static string Signature(Receiver receiver, AppSettings settings) => $"{receiver.TransportKey}|{settings.EffectiveEndpoint}|{settings.Latency(receiver.Id)}|{settings.StreamSampleRate}|{settings.LocalPlaybackEnabled}|{settings.LocalPlaybackEndpoint}|{settings.LocalPlaybackChannel}|{settings.LocalPlaybackAutoDelay}|{string.Join(",", receiver.Peers.Select(p => ChannelOptions.Normalize(settings.ReadOptions(p.Id).Channel)))}";
+    private static object? LocalMonitorParameters(AppSettings settings) =>
+        settings.LocalPlaybackEnabled ? new { endpoint = settings.LocalPlaybackEndpoint, delay_ms = settings.LocalPlaybackDelay, auto_delay = settings.LocalPlaybackAutoDelay, channel = settings.LocalPlaybackChannel } : null;
+    /// A left/right split must pair every output of the session exactly once; the engine rejects anything else.
+    private static string? ValidateChannelLayout(Receiver receiver, AppSettings settings)
+    {
+        var channels = new List<string>();
+        foreach (var peer in receiver.Peers) channels.Add(ChannelOptions.Normalize(settings.ReadOptions(peer.Id).Channel));
+        if (settings.LocalPlaybackEnabled) channels.Add(ChannelOptions.Normalize(settings.LocalPlaybackChannel));
+        if (ChannelOptions.IsValidSplit(channels)) return null;
+        if (channels.All(c => !ChannelOptions.IsSplit(c))) return null;
+        return channels.Any(c => !ChannelOptions.IsSplit(c))
+            ? L.Get("A channel split must cover every output: no output may keep playing both channels.")
+            : L.Get("A channel split needs exactly one left and one right output.");
+    }
     public async Task StartAsync(Receiver receiver, AppSettings settings)
     {
         if (!receiver.Complete) throw new InvalidOperationException(L.Get("Both stereo pair members must be online."));
@@ -192,7 +208,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         await StopLockedAsync().ConfigureAwait(false);
         _settings = settings.Clone(); _receiver = receiver;
         var epoch = ++_generation;
-        lock (_sync) { _diagnostics = new(); _warnings.Clear(); _snapshot = new(PlaybackState.Idle); }
+        lock (_sync) { _diagnostics = new(); _warnings.Clear(); _autoAlignmentDelay = null; _snapshot = new(PlaybackState.Idle); }
         _lifetime = new();
         var cancellation = _lifetime.Token;
         Publish(epoch, requestPin is null ? PlaybackState.Connecting : PlaybackState.Pairing);
@@ -231,7 +247,10 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
             var old = _settings;
             _settings = settings.Clone();
             lock (_sync) ++_equalizerSequence;
-            if (_receiver is { } receiver && Snapshot.IsActive && Snapshot.State != PlaybackState.Pairing && Signature(receiver, old) != Signature(receiver, settings))
+            // A failed session keeps its receiver, so saving a repaired layout (for example a
+            // channel split that now covers every output) retries the stream instead of stranding
+            // the user in the error state until they stop and start the receiver by hand.
+            if (_receiver is { } receiver && Snapshot.State is not (PlaybackState.Idle or PlaybackState.Pairing) && Signature(receiver, old) != Signature(receiver, settings))
                 await StartLockedAsync(receiver, settings, null).ConfigureAwait(false);
             else
             {
@@ -239,6 +258,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                 else if (Snapshot.State is PlaybackState.Streaming or PlaybackState.Standby) await audio.MuteAsync(settings.EffectiveEndpoint).ConfigureAwait(false);
                 await SendGainAsync().ConfigureAwait(false);
                 await SendEqualizerAsync().ConfigureAwait(false);
+                await SendLocalPlaybackDelayAsync(settings.LocalPlaybackDelay).ConfigureAwait(false);
             }
         }
         finally { _serial.Release(); }
@@ -259,6 +279,23 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         }
         finally { _serial.Release(); }
     }
+    /// Adjust the local alignment delay without restarting the session.
+    public async Task SetLocalPlaybackDelayAsync(int delayMs)
+    {
+        await _serial.WaitAsync().ConfigureAwait(false);
+        try { await SendLocalPlaybackDelayAsync(delayMs).ConfigureAwait(false); }
+        finally { _serial.Release(); }
+    }
+    private async Task SendLocalPlaybackDelayAsync(int delayMs)
+    {
+        IEngineConnection? connection; string? session;
+        lock (_sync) { connection = _connection; session = _sessionId; }
+        if (connection is null || session is null || _receiver is null) return;
+        if (Snapshot.State is not (PlaybackState.Streaming or PlaybackState.Standby)) return;
+        var delay = Math.Clamp(delayMs, 0, AppSettings.MaxLocalPlaybackDelayMs);
+        try { await connection.SendAsync(session, "set_local_monitor", new { delay_ms = delay }, CancellationToken.None).ConfigureAwait(false); }
+        catch (Exception error) when (error is IOException or ObjectDisposedException or InvalidOperationException) { log?.Invoke(L.Format("Local playback delay update deferred to the next session: {0}", error.Message)); }
+    }
     public async Task SetMutedAsync(bool muted)
     {
         await _serial.WaitAsync().ConfigureAwait(false);
@@ -276,6 +313,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
     }
     private async Task RunStreamAsync(Receiver receiver, long epoch, CancellationToken cancellation)
     {
+        if (ValidateChannelLayout(receiver, _settings) is { } layoutError) throw new InvalidOperationException(layoutError);
         var attempts = 0;
         while (!cancellation.IsCancellationRequested)
         {
@@ -290,7 +328,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                 {
                     var host = await ResolveAsync(member.Address, cancellation).ConfigureAwait(false);
                     volumeHost ??= host;
-                    peers.Add(new { host, port = member.Port, codecs = member.Codecs.Select(x => (int)x).ToArray() });
+                    peers.Add(new { host, port = member.Port, codecs = member.Codecs.Select(x => (int)x).ToArray(), channel = ChannelOptions.Normalize(settings.ReadOptions(member.Id).Channel) });
                 }
                 await using var connection = factory.Open();
                 var session = Guid.NewGuid().ToString("N");
@@ -303,7 +341,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                     await _equalizerWriter.WaitAsync(cancellation).ConfigureAwait(false);
                     try
                     {
-                        await connection.SendAsync(session, "start", new { peers, source = "loopback", duration_ms = 0, latency_ms = settings.Latency(receiver.Id), gain = Gain(receiver), timing = "ptp", capture_endpoint = settings.EffectiveEndpoint, sample_rate = int.Parse(settings.StreamSampleRate), equalizer = EffectiveEqualizer().WireParameters() }, cancellation).ConfigureAwait(false);
+                        await connection.SendAsync(session, "start", new { peers, source = "loopback", duration_ms = 0, latency_ms = settings.Latency(receiver.Id), gain = Gain(receiver), timing = "ptp", capture_endpoint = settings.EffectiveEndpoint, sample_rate = int.Parse(settings.StreamSampleRate), equalizer = EffectiveEqualizer().WireParameters(), local_monitor = LocalMonitorParameters(settings) }, cancellation).ConfigureAwait(false);
                         lock (_sync) { if (epoch == _generation && ReferenceEquals(_connection, connection)) _equalizerReady = true; }
                     }
                     finally { _equalizerWriter.Release(); }
@@ -321,6 +359,17 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
                         {
                             lock (_sync) { if (epoch != _generation || item.Integer("sequence") != _equalizerSequence) continue; }
                             EqualizerFeedback?.Invoke(kind == "equalizer_error" ? item.Text("message", L.Get("Could not update the equalizer.")) : null);
+                        }
+                        if (kind == "alignment_auto")
+                        {
+                            // The engine matched the local copy to the slowest receiver latency.
+                            lock (_sync)
+                            {
+                                if (epoch != _generation) continue;
+                                _autoAlignmentDelay = item.Integer("delay_ms") is { } detected ? (int)detected : null;
+                                log?.Invoke($"Local alignment auto delay: {_autoAlignmentDelay} ms; receiver latencies {item}");
+                            }
+                            var current = Snapshot; Publish(epoch, current.State, current.Message);
                         }
                         if (kind == "streaming")
                         {
@@ -469,7 +518,7 @@ public sealed class SessionController(IEngineFactory factory, IAudioService audi
         lock (_sync)
         {
             if (epoch != _generation) return;
-            snapshot = new(state, _receiver, message, metrics ?? _snapshot.Metrics, _receiver is null ? 0 : _settings.Latency(_receiver.Id), _diagnostics, int.TryParse(_settings.StreamSampleRate, out var streamRate) ? streamRate : 0, _deviceVolume);
+            snapshot = new(state, _receiver, message, metrics ?? _snapshot.Metrics, _receiver is null ? 0 : _settings.Latency(_receiver.Id), _diagnostics, int.TryParse(_settings.StreamSampleRate, out var streamRate) ? streamRate : 0, _deviceVolume, _autoAlignmentDelay);
             _snapshot = snapshot;
         }
         Changed?.Invoke(snapshot);

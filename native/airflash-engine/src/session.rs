@@ -11,7 +11,7 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use plist::{Dictionary, Value};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 use std::{
     net::{IpAddr, SocketAddr, UdpSocket},
@@ -30,6 +30,9 @@ pub struct Peer {
     pub port: u16,
     #[serde(default)]
     pub codecs: Vec<u8>,
+    /// Channels this receiver renders; both channels unless split externally.
+    #[serde(default)]
+    pub channel: Channel,
 }
 fn default_port() -> u16 {
     7000
@@ -37,10 +40,81 @@ fn default_port() -> u16 {
 fn default_sample_rate() -> u32 {
     44100
 }
+/// Which stereo channels of the stream an output renders. Two outputs can be
+/// split into one left-only and one right-only render to form an external pair.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Channel {
+    #[default]
+    Both,
+    Left,
+    Right,
+}
+impl Channel {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "both" => Some(Self::Both),
+            "left" => Some(Self::Left),
+            "right" => Some(Self::Right),
+            _ => None,
+        }
+    }
+    /// Keep this channel of interleaved big-endian S16 stereo, silence the other.
+    pub fn mask(&self, pcm: &mut [u8]) {
+        if *self == Self::Both {
+            return;
+        }
+        let keep_left = *self == Self::Left;
+        for (index, sample) in pcm.chunks_exact_mut(2).enumerate() {
+            if (index % 2 == 0) != keep_left {
+                sample.copy_from_slice(&[0, 0]);
+            }
+        }
+    }
+}
+/// Every output that plays one channel only must complete exactly one pair.
+fn validate_channels(outputs: &[Channel]) -> Result<()> {
+    if outputs.iter().all(|c| *c == Channel::Both) {
+        return Ok(());
+    }
+    ensure!(
+        outputs.iter().all(|c| *c != Channel::Both),
+        "channel split covers every output: no output may play both channels"
+    );
+    ensure!(
+        outputs.iter().filter(|c| **c == Channel::Left).count() == 1
+            && outputs.iter().filter(|c| **c == Channel::Right).count() == 1,
+        "channel split needs exactly one left and one right output"
+    );
+    Ok(())
+}
+/// The local copy waits as long as the slowest receiver so both paths align.
+fn auto_alignment_delay(latencies_ms: &[u32]) -> u32 {
+    latencies_ms.iter().copied().max().unwrap_or(0)
+}
+/// Local playback that mirrors the streamed audio after an alignment delay.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalMonitorOptions {
+    /// Local output endpoint; the default render device when unset.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Alignment delay in milliseconds, used in manual mode.
+    #[serde(default)]
+    pub delay_ms: u32,
+    /// Follow the delay the receivers report instead of a manual value.
+    #[serde(default)]
+    pub auto_delay: bool,
+    /// Channels the local device renders; both channels unless split externally.
+    #[serde(default)]
+    pub channel: Channel,
+}
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProbeOptions {
     pub peers: Vec<Peer>,
+    #[serde(default)]
+    pub local_monitor: Option<LocalMonitorOptions>,
     #[serde(default)]
     pub wav_path: PathBuf,
     #[serde(default = "default_source")]
@@ -124,6 +198,21 @@ impl ProbeOptions {
             crate::rtp::SUPPORTED_RATES.contains(&self.sample_rate),
             "sample rate must be 44100 or 48000"
         );
+        if let Some(monitor) = &self.local_monitor {
+            ensure!(
+                monitor.delay_ms <= crate::monitor::MAX_DELAY_MS,
+                "local monitor delay must be 0..2000 ms"
+            );
+            ensure!(
+                monitor.endpoint.as_deref() != self.capture_endpoint.as_deref(),
+                "local monitor endpoint must differ from the capture endpoint"
+            );
+        }
+        let mut outputs: Vec<Channel> = self.peers.iter().map(|p| p.channel).collect();
+        if let Some(monitor) = &self.local_monitor {
+            outputs.push(monitor.channel);
+        }
+        validate_channels(&outputs)?;
         Ok(())
     }
 }
@@ -196,6 +285,7 @@ impl Drop for NtpServer {
 }
 struct Member {
     peer: Peer,
+    channel: Channel,
     conn: std::sync::Arc<std::sync::Mutex<Connection>>,
     events: Option<EventWorker>,
     feedback: Option<FeedbackWorker>,
@@ -267,6 +357,7 @@ impl Member {
         }
         let mut member = Self {
             peer: peer.clone(),
+            channel: peer.channel,
             conn: std::sync::Arc::new(std::sync::Mutex::new(conn)),
             events: None,
             feedback: None,
@@ -502,6 +593,26 @@ pub fn probe_with_controls(
     equalizer: crate::equalizer::Control,
     emit: impl Fn(Json),
 ) -> Result<()> {
+    probe_with_monitor(
+        options,
+        cancel,
+        gain,
+        volume,
+        equalizer,
+        crate::monitor::Delay::default(),
+        emit,
+    )
+}
+/// Streaming entry point with a host-controlled local monitor delay.
+pub fn probe_with_monitor(
+    options: ProbeOptions,
+    cancel: Cancellation,
+    gain: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    volume: crate::volume::Control,
+    equalizer: crate::equalizer::Control,
+    monitor_delay: crate::monitor::Delay,
+    emit: impl Fn(Json),
+) -> Result<()> {
     if options.duration_ms == 0 {
         options.validate_start()?;
     } else {
@@ -576,6 +687,30 @@ pub fn probe_with_controls(
             thread::sleep(Duration::from_millis(2));
         }
     }
+    let monitor = match &options.local_monitor {
+        Some(spec) => {
+            // The receivers report their output latency once SETUP completes.
+            if spec.auto_delay {
+                let negotiated: Vec<u32> = members.iter().map(|m| m.media.latency_ms()).collect();
+                let auto = auto_alignment_delay(&negotiated);
+                monitor_delay.set_ms(auto);
+                emit(
+                    json!({"event":"alignment_auto","delay_ms":auto,"member_latency_ms":negotiated,"requested_latency_ms":options.latency_ms}),
+                );
+            }
+            let monitor = crate::monitor::Monitor::start(
+                spec.endpoint.clone(),
+                rate,
+                monitor_delay,
+            )
+            .context("local monitor")?;
+            emit(
+                json!({"event":"local_monitor","endpoint":spec.endpoint,"delay_ms":monitor.delay_ms(),"auto_delay":spec.auto_delay,"channel":spec.channel,"receiver_latency_ms":members.iter().map(|m|m.media.latency_ms()).collect::<Vec<_>>(),"sample_rate":rate}),
+            );
+            Some(monitor)
+        }
+        None => None,
+    };
     let start = Instant::now();
     let duration = Duration::from_millis(options.duration_ms as u64);
     let latency = options.latency_ms * rate / 1000;
@@ -647,6 +782,16 @@ pub fn probe_with_controls(
                     bytes.copy_from_slice(&sample.to_be_bytes());
                 }
             }
+            let monitor_channel = options.local_monitor.as_ref().map(|m| m.channel).unwrap_or_default();
+            if let Some(monitor) = &monitor {
+                if monitor_channel == Channel::Both {
+                    monitor.push_pcm(&pcm);
+                } else {
+                    let mut masked = pcm.clone();
+                    monitor_channel.mask(&mut masked);
+                    monitor.push_pcm(&masked);
+                }
+            }
             if now >= next_metrics {
                 if let Some(source) = &live {
                     emit(json!({"event":"capture_metrics","metrics":source.metrics()}));
@@ -656,13 +801,25 @@ pub fn probe_with_controls(
             }
             // Every member gets new media before any member services retransmissions.
             for member in &mut members {
-                member.media.send(
-                    &pcm,
-                    packets == 0,
-                    Instant::now(),
-                    schedule.deadline(),
-                    &member.health,
-                )?;
+                if member.channel == Channel::Both {
+                    member.media.send(
+                        &pcm,
+                        packets == 0,
+                        Instant::now(),
+                        schedule.deadline(),
+                        &member.health,
+                    )?;
+                } else {
+                    let mut masked = pcm.clone();
+                    member.channel.mask(&mut masked);
+                    member.media.send(
+                        &masked,
+                        packets == 0,
+                        Instant::now(),
+                        schedule.deadline(),
+                        &member.health,
+                    )?;
+                }
             }
             for member in &mut members {
                 member.media.service_retransmits();
@@ -708,16 +865,134 @@ fn transport_metrics(members: &[Member], schedule: &MediaSchedule) -> Json {
 mod tests {
     use super::*;
     #[test]
+    fn local_monitor_requires_a_different_endpoint_and_bounded_delay() {
+        let mut o = ProbeOptions {
+            peers: vec![Peer {
+                host: "127.0.0.1".parse().unwrap(),
+                port: 7000,
+                codecs: Vec::new(),
+                channel: Channel::Both,
+            }],
+            wav_path: PathBuf::new(),
+            source: "loopback".into(),
+            capture_endpoint: Some("capture-id".into()),
+            local_monitor: None,
+            duration_ms: 0,
+            latency_ms: 200,
+            gain: 1.0,
+            equalizer: crate::equalizer::Settings::default(),
+            sample_rate: 44100,
+            timing: "ptp".into(),
+            group_id: None,
+            handshake_only: false,
+            record_mic_path: None,
+        };
+        assert!(o.validate_start().is_ok());
+        // The default render device is only rejected when it is also the capture source.
+        o.local_monitor = Some(LocalMonitorOptions { endpoint: Some("capture-id".into()), delay_ms: 0, auto_delay: false, channel: Channel::Both });
+        assert!(o.validate_start().is_err());
+        o.capture_endpoint = None;
+        o.local_monitor = Some(LocalMonitorOptions { endpoint: None, delay_ms: 0, auto_delay: false, channel: Channel::Both });
+        assert!(o.validate_start().is_err());
+        o.capture_endpoint = Some("capture-id".into());
+        o.local_monitor = Some(LocalMonitorOptions { endpoint: None, delay_ms: 0, auto_delay: false, channel: Channel::Both });
+        assert!(o.validate_start().is_ok());
+        o.local_monitor = Some(LocalMonitorOptions { endpoint: Some("speakers".into()), delay_ms: 2001, auto_delay: false, channel: Channel::Both });
+        assert!(o.validate_start().is_err());
+        o.local_monitor = Some(LocalMonitorOptions { endpoint: Some("speakers".into()), delay_ms: 250, auto_delay: false, channel: Channel::Both });
+        assert!(o.validate_start().is_ok());
+    }
+    #[test]
+    fn channel_mask_keeps_one_channel() {
+        let mut stereo: Vec<u8> = [1i16, -1, 2, -2, 3, -3, 4, -4]
+            .iter()
+            .flat_map(|s| s.to_be_bytes())
+            .collect();
+        Channel::Both.mask(&mut stereo);
+        assert_eq!(stereo, [1i16, -1, 2, -2, 3, -3, 4, -4].iter().flat_map(|s| s.to_be_bytes()).collect::<Vec<u8>>());
+        Channel::Left.mask(&mut stereo);
+        assert_eq!(stereo, [1i16, 0, 2, 0, 3, 0, 4, 0].iter().flat_map(|s| s.to_be_bytes()).collect::<Vec<u8>>());
+        Channel::Right.mask(&mut stereo);
+        assert_eq!(stereo, [0i16, 0, 0, 0, 0, 0, 0, 0].iter().flat_map(|s| s.to_be_bytes()).collect::<Vec<u8>>());
+    }
+    #[test]
+    fn channel_split_must_cover_every_output_exactly_once() {
+        assert!(validate_channels(&[]).is_ok());
+        assert!(validate_channels(&[Channel::Both, Channel::Both]).is_ok());
+        assert!(validate_channels(&[Channel::Left, Channel::Right]).is_ok());
+        assert!(validate_channels(&[Channel::Right, Channel::Left]).is_ok());
+        // One channel missing, one duplicated, or a mix with an unsplit output.
+        assert!(validate_channels(&[Channel::Left]).is_err());
+        assert!(validate_channels(&[Channel::Left, Channel::Left]).is_err());
+        assert!(validate_channels(&[Channel::Both, Channel::Left]).is_err());
+        assert!(validate_channels(&[Channel::Both, Channel::Left, Channel::Right]).is_err());
+        assert!(validate_channels(&[Channel::Left, Channel::Right, Channel::Right]).is_err());
+        assert_eq!(Channel::parse("left"), Some(Channel::Left));
+        assert_eq!(Channel::parse("both"), Some(Channel::Both));
+        assert_eq!(Channel::parse("centre"), None);
+    }
+    #[test]
+    fn auto_delay_follows_the_slowest_receiver() {
+        assert_eq!(auto_alignment_delay(&[]), 0);
+        assert_eq!(auto_alignment_delay(&[120, 200]), 200);
+        assert_eq!(auto_alignment_delay(&[500]), 500);
+    }
+    #[test]
+    fn local_monitor_channel_and_auto_delay_are_bounded() {
+        let left = Peer { host: "127.0.0.1".parse().unwrap(), port: 7000, codecs: Vec::new(), channel: Channel::Left };
+        let right = Peer { host: "127.0.0.2".parse().unwrap(), port: 7000, codecs: Vec::new(), channel: Channel::Right };
+        let both = Peer { host: "127.0.0.3".parse().unwrap(), port: 7000, codecs: Vec::new(), channel: Channel::Both };
+        let mut o = ProbeOptions {
+            peers: vec![left.clone()],
+            wav_path: PathBuf::new(),
+            source: "loopback".into(),
+            capture_endpoint: None,
+            local_monitor: None,
+            duration_ms: 0,
+            latency_ms: 200,
+            gain: 1.0,
+            equalizer: crate::equalizer::Settings::default(),
+            sample_rate: 44100,
+            timing: "ptp".into(),
+            group_id: None,
+            handshake_only: false,
+            record_mic_path: None,
+        };
+        // A single left-only receiver: the other side of the pair is missing.
+        assert!(o.validate_start().is_err());
+        // The local copy supplies the right channel and completes the pair.
+        o.local_monitor = Some(LocalMonitorOptions { endpoint: Some("speakers".into()), delay_ms: 0, auto_delay: true, channel: Channel::Right });
+        assert!(o.validate_start().is_ok());
+        // Two receivers already form the pair, so a third split output is refused.
+        o.peers.push(right.clone());
+        assert!(o.validate_start().is_err());
+        // Two receivers on their own are fine.
+        o.peers = vec![left, right.clone()];
+        o.local_monitor = None;
+        assert!(o.validate_start().is_ok());
+        // An unsplit output may not sit next to split ones.
+        o.peers = vec![both.clone(), Peer { channel: Channel::Left, ..right.clone() }];
+        assert!(o.validate_start().is_err());
+        // The requested delay stays bounded even when auto alignment fills it in.
+        o.peers = vec![both];
+        o.local_monitor = Some(LocalMonitorOptions { endpoint: Some("speakers".into()), delay_ms: 2001, auto_delay: true, channel: Channel::Both });
+        assert!(o.validate_start().is_err());
+        o.local_monitor = Some(LocalMonitorOptions { endpoint: Some("speakers".into()), delay_ms: 250, auto_delay: true, channel: Channel::Both });
+        assert!(o.validate_start().is_ok());
+    }
+    #[test]
     fn unsafe_probe_rejected() {
         let mut o = ProbeOptions {
             peers: vec![Peer {
                 host: "127.0.0.1".parse().unwrap(),
                 port: 7000,
                 codecs: Vec::new(),
+                channel: Channel::Both,
             }],
             wav_path: PathBuf::new(),
             source: "wav".into(),
             capture_endpoint: None,
+            local_monitor: None,
             duration_ms: 5001,
             latency_ms: 200,
             gain: 0.1,

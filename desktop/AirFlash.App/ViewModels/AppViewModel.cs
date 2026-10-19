@@ -51,6 +51,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
     public string MonitorQueue => _snapshot.Metrics?.MaxQueueAge is { } ms ? $"{ms:F1} ms" : "—";
     public string MonitorUnderruns => _snapshot.Metrics?.Underruns?.ToString() ?? "—";
     public string MonitorDrops => _snapshot.Metrics?.DroppedFrames?.ToString() ?? "—";
+    public string MonitorAutoAlignment => _snapshot.AutoAlignmentDelay is { } ms ? $"{ms} ms" : "—";
     public string MonitorRate => _snapshot.Metrics is { InputRate: > 0 } m ? $"{m.InputRate:N0} Hz" : "—";
     public string MonitorStreamRate => _snapshot.StreamRate is { } rate and > 0 ? $"{rate:N0} Hz · 16-bit" : "—";
     public string MonitorRecoveries => _snapshot.Diagnostics?.Transport?.SenderLateRecoveries?.ToString() ?? "—";
@@ -339,6 +340,7 @@ public sealed class AppViewModel : ObservableObject, IAsyncDisposable
         {
             [nameof(MonitorLatency)] = MonitorLatency, [nameof(MonitorQueue)] = MonitorQueue,
             [nameof(MonitorUnderruns)] = MonitorUnderruns, [nameof(MonitorDrops)] = MonitorDrops,
+            [nameof(MonitorAutoAlignment)] = MonitorAutoAlignment,
             [nameof(MonitorRate)] = MonitorRate, [nameof(MonitorStreamRate)] = MonitorStreamRate,
             [nameof(MonitorRecoveries)] = MonitorRecoveries,
             [nameof(MonitorSkipped)] = MonitorSkipped, [nameof(MonitorReconnects)] = MonitorReconnects,

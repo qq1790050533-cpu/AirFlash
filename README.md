@@ -46,6 +46,7 @@ or a similar tool, and route the audio you want to stream to that endpoint.
   automatic reconnection, and connection diagnostics.
 - Provides a ten-band equalizer with presets and live preview in Settings.
 - Captures playback or recording endpoints, including virtual audio devices.
+- Plays the streamed audio locally after an alignment delay so local speakers and the receiver match. See [Audio alignment](docs/AUDIO-ALIGNMENT.md).
 - Available as a portable Windows x64 app with English, Simplified Chinese, and Traditional Chinese UI.
 
 ## Feature plan

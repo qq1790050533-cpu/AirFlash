@@ -1,3 +1,20 @@
+# Unreleased
+
+Windows x64 · Minimum target: Windows 10 1809 / build 17763 · Windows 11
+English, Simplified Chinese, and Traditional Chinese
+
+Not yet released; entries below are local to the `audio-alignment` branch.
+
+## Features
+
+- Play the streamed audio on a second local output with an adjustable alignment delay, so the computer's own speakers stay in sync with the AirPlay receivers. Set it in Settings → Audio capture → Local alignment; the delay applies without restarting the session. See [Audio alignment](https://github.com/Ding-Kyoma/AirFlash/blob/audio-alignment/docs/AUDIO-ALIGNMENT.md).
+- Assign each output — every AirPlay receiver member and the local playback device — to the left or the right channel, turning two devices into one stereo pair. A split must cover every output exactly once, and the rules are enforced by the engine and by Settings before the session starts.
+- Detect receiver latency automatically for the local alignment delay, using the latency each AirPlay device reports, and show the detected value in Settings → Monitor → Detected receiver latency.
+
+## Bug Fixes
+
+- Keep a failed session recoverable: saving settings that repair the previous failure — for example a channel split that now covers every output — retries the stream on the same receiver instead of leaving the session in the error state until it is stopped and started by hand.
+
 # AirFlash 0.4.0
 
 Windows x64 · Minimum target: Windows 10 1809 / build 17763 · Windows 11

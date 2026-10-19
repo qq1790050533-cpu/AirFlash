@@ -13,6 +13,9 @@ pub mod wasapi;
 pub mod live;
 
 #[cfg(windows)]
+pub mod monitor;
+
+#[cfg(windows)]
 pub mod credentials;
 
 pub mod transport;

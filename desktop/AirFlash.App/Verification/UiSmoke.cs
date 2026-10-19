@@ -13,6 +13,7 @@ using AirFlash.App.Services;
 using AirFlash.App.Ui;
 using AirFlash.App.ViewModels;
 using AirFlash.Core;
+using ChannelOptions = AirFlash.Core.ChannelOptions;
 namespace AirFlash.App.Verification;
 // Opt-in, isolated UI verification. Never constructs real discovery, audio or autostart services.
 internal static class UiSmoke
@@ -140,6 +141,37 @@ internal static class UiSmoke
             SendMessage(tray.WindowHandle, RegisterWindowMessage("TaskbarCreated"), IntPtr.Zero, IntPtr.Zero); await Pump();
             Check(tray.IsRegisteredForVerification, "repeated Explorer notification retains one registered tray icon", checks);
             Check(!settings.ApplyButton.IsEnabled, "apply initially disabled", checks);
+            // Local alignment: channel split and automatic delay detection.
+            settings.ViewModel.SelectedPage = SettingsViewModel.AudioCapturePage; await Pump();
+            var localChannels = Descendants(settings).OfType<ComboBox>().Where(c => System.Windows.Automation.AutomationProperties.GetName(c) == L.Get("Channel")).ToArray();
+            Check(localChannels.Length == 1 && string.Join(",", ((IEnumerable<Choice>)localChannels[0].ItemsSource).Select(c => c.Value)) == $"{ChannelOptions.Both},{ChannelOptions.Left},{ChannelOptions.Right}", "local channel offers both, left and right", checks);
+            var autoDelayBox = Descendants(settings).OfType<CheckBox>().Single(c => (string?)c.Content == L.Get("Detect receiver delay automatically"));
+            Check(!settings.ViewModel.LocalDelayAdjustable, "manual delay waits for local playback", checks);
+            settings.ViewModel.Draft.LocalPlaybackEnabled = true; await Pump();
+            Check(settings.ViewModel.LocalDelayAdjustable, "manual delay follows local playback", checks);
+            autoDelayBox.IsChecked = true; await Pump();
+            Check(!settings.ViewModel.LocalDelayAdjustable, "automatic detection disables the manual slider", checks);
+            autoDelayBox.IsChecked = false; await Pump();
+            settings.ViewModel.Draft.LocalPlaybackEndpoint = "endpoint-a";
+            settings.ViewModel.Draft.LocalPlaybackAutoDelay = true;
+            settings.ViewModel.Draft.LocalPlaybackChannel = ChannelOptions.Right;
+            settings.ViewModel.Draft.Options("a").Channel = ChannelOptions.Left;
+            localChannels[0].BringIntoView(); await Pump();
+            Render(settings, Path.Combine(directory, "settings-local-alignment.png"), 1);
+            Invoke(settings.ApplyButton); await Until(() => !settings.ViewModel.HasChanges);
+            var aligned = engine.Commands.Last(c => c.Text("command") == "start");
+            Check(aligned.GetProperty("params").GetProperty("peers")[0].Text("channel") == ChannelOptions.Left, "receiver channel reaches the engine", checks);
+            var monitorWire = aligned.GetProperty("params").GetProperty("local_monitor");
+            Check(monitorWire.Text("channel") == ChannelOptions.Right && monitorWire.Boolean("auto_delay") == true, "local channel and automatic delay reach the engine", checks);
+            // A split that leaves one output on both channels fails with the outputs to fix.
+            settings.ViewModel.Draft.LocalPlaybackChannel = ChannelOptions.Both;
+            Invoke(settings.ApplyButton); await Until(() => !settings.ViewModel.HasChanges && app.Snapshot.State == PlaybackState.Error);
+            Check(app.Snapshot.Message == L.Get("A channel split must cover every output: no output may keep playing both channels."), "broken channel split names the outputs to fix", checks);
+            settings.ViewModel.Draft.LocalPlaybackChannel = ChannelOptions.Right;
+            Invoke(settings.ApplyButton); await Until(() => app.Snapshot.State == PlaybackState.Streaming && !settings.ViewModel.HasChanges);
+            settings.ViewModel.Draft.Options("a").Channel = ChannelOptions.Both;
+            settings.ViewModel.Draft.LocalPlaybackEnabled = false; settings.ViewModel.Draft.LocalPlaybackAutoDelay = false; settings.ViewModel.Draft.LocalPlaybackChannel = ChannelOptions.Both;
+            Invoke(settings.ApplyButton); await Until(() => !settings.ViewModel.HasChanges && app.Snapshot.State == PlaybackState.Streaming);
             settings.ViewModel.SelectedPage = SettingsViewModel.AudioCapturePage; await Pump();
             var radio = Descendants(settings).OfType<RadioButton>().Single(r => (string?)r.Content == L.Get("Specific audio endpoint"));
             var radioPeer = UIElementAutomationPeer.CreatePeerForElement(radio)!;
@@ -173,6 +205,8 @@ internal static class UiSmoke
             retries.Text = "5"; await Pump();
             settings.ViewModel.AddManual("书房", "127.0.0.2", 7000); await settings.ViewModel.ApplyAsync();
             Check(app.Settings.ManualReceivers.Count == 1, "manual receiver persists", checks);
+            var pairRow = settings.ViewModel.Receivers.Single(r => r.Receiver.Id == "b");
+            Check(pairRow.Members.Count == 2 && string.Join(",", pairRow.Members.Select(m => m.Label)) == "127.0.0.2:7000,127.0.0.3:7000", "stereo pair lists one channel row per member", checks);
             var firstId = app.Receivers[0].Receiver.Id;
             settings.ViewModel.Draft.Options(firstId).Hidden = true; await settings.ViewModel.ApplyAsync();
             Check(app.Receivers.All(r => r.Receiver.Id != firstId) && settings.ViewModel.Receivers.Any(r => r.Receiver.Id == firstId), "hidden receiver stays recoverable", checks);

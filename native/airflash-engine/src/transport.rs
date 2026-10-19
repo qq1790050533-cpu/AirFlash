@@ -448,6 +448,14 @@ impl MediaTransport {
         self.estimated = estimated;
         self.packetizer.configure_latency(latency);
     }
+    /// Output latency the receiver agreed to, in whole milliseconds.
+    pub fn latency_ms(&self) -> u32 {
+        self.latency.as_millis().min(u32::MAX as u128) as u32
+    }
+    /// Whether `latency_ms` came from the receiver or from our own request.
+    pub fn latency_estimated(&self) -> bool {
+        self.estimated
+    }
     pub fn control_port(&self) -> Result<u16> {
         Ok(self.control.local_addr()?.port())
     }

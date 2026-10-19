@@ -301,6 +301,68 @@ public sealed class SessionTests
         await Until(() => controller.Snapshot.Metrics?.Underruns == 1);
         Assert.Null(controller.Snapshot.Diagnostics!.Transport); Assert.Empty(controller.Snapshot.Diagnostics.Warnings ?? []);
     }
+    [Fact]
+    public async Task ChannelSplitIsSentPerOutputAndRestartsWhenAssigned()
+    {
+        var first = new FakeConnection(); var second = new FakeConnection(); var factory = new FakeFactory(first, second); await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
+        var settings = Settings(); settings.LocalPlaybackEnabled = true; settings.LocalPlaybackEndpoint = "speakers";
+        await controller.StartAsync(Pod(), settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        var start = first.Commands.Single(c => c.Command == "start");
+        Assert.Equal("both", start.Parameters.GetProperty("peers")[0].Text("channel"));
+        Assert.Equal("both", start.Parameters.GetProperty("local_monitor").Text("channel"));
+        Assert.False(start.Parameters.GetProperty("local_monitor").Boolean("auto_delay"));
+        settings.Options("a").Channel = "left"; settings.LocalPlaybackChannel = "right"; settings.LocalPlaybackAutoDelay = true;
+        await controller.UpdateSettingsAsync(settings); await second.Started.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.Equal(2, factory.OpenCount);
+        var restart = second.Commands.Single(c => c.Command == "start");
+        Assert.Equal("left", restart.Parameters.GetProperty("peers")[0].Text("channel"));
+        Assert.Equal("right", restart.Parameters.GetProperty("local_monitor").Text("channel"));
+        Assert.True(restart.Parameters.GetProperty("local_monitor").Boolean("auto_delay"));
+    }
+    [Fact]
+    public async Task BrokenChannelSplitStopsBeforeTheEngineStarts()
+    {
+        var factory = new FakeFactory(); await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
+        var settings = Settings(); settings.Options("a").Channel = "left"; settings.LocalPlaybackEnabled = true; settings.LocalPlaybackEndpoint = "speakers";
+        await controller.StartAsync(Pod(), settings); await Until(() => controller.Snapshot.State == PlaybackState.Error);
+        Assert.Equal(0, factory.OpenCount);
+        Assert.Equal(L.Get("A channel split must cover every output: no output may keep playing both channels."), controller.Snapshot.Message);
+        var pair = Pod("stereo:pair") with { Members = [Pod(), Pod("b") with { Address = "127.0.0.2" }] };
+        settings = Settings(); settings.Options("a").Channel = "left"; settings.Options("b").Channel = "left";
+        await controller.StartAsync(pair, settings); await Until(() => controller.Snapshot.State == PlaybackState.Error);
+        Assert.Equal(0, factory.OpenCount);
+        Assert.Equal(L.Get("A channel split needs exactly one left and one right output."), controller.Snapshot.Message);
+    }
+
+    [Fact]
+    public async Task ChannelSplitErrorRecoversWhenTheLayoutIsRepaired()
+    {
+        var first = new FakeConnection(); var second = new FakeConnection();
+        var factory = new FakeFactory(first, second); await using var controller = new SessionController(factory, new FakeAudio(), timing: Fast);
+        var settings = Settings(); settings.LocalPlaybackEnabled = true; settings.LocalPlaybackEndpoint = "speakers";
+        await controller.StartAsync(Pod(), settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        var broken = Settings(); broken.LocalPlaybackEnabled = true; broken.LocalPlaybackEndpoint = "speakers"; broken.Options("a").Channel = "left";
+        await controller.UpdateSettingsAsync(broken); await Until(() => controller.Snapshot.State == PlaybackState.Error);
+        Assert.Equal(1, factory.OpenCount);
+        Assert.Equal(L.Get("A channel split must cover every output: no output may keep playing both channels."), controller.Snapshot.Message);
+        var repaired = Settings(); repaired.LocalPlaybackEnabled = true; repaired.LocalPlaybackEndpoint = "speakers"; repaired.Options("a").Channel = "left"; repaired.LocalPlaybackChannel = "right";
+        await controller.UpdateSettingsAsync(repaired); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        Assert.Equal(2, factory.OpenCount);
+        var restart = second.Commands.Single(c => c.Command == "start");
+        Assert.Equal("left", restart.Parameters.GetProperty("peers")[0].Text("channel"));
+        Assert.Equal("right", restart.Parameters.GetProperty("local_monitor").Text("channel"));
+    }
+    [Fact]
+    public async Task AutoAlignmentDelayReachesTheMonitorAndClearsOnSwitch()
+    {
+        var first = new FakeConnection(); var second = new FakeConnection(); await using var controller = new SessionController(new FakeFactory(first, second), new FakeAudio(), timing: Fast);
+        var settings = Settings(); settings.LocalPlaybackEnabled = true; settings.LocalPlaybackEndpoint = "speakers"; settings.LocalPlaybackAutoDelay = true;
+        await controller.StartAsync(Pod(), settings); await Until(() => controller.Snapshot.State == PlaybackState.Streaming);
+        first.EmitData(new { @event = "alignment_auto", delay_ms = 480 });
+        await Until(() => controller.Snapshot.AutoAlignmentDelay == 480);
+        await controller.StartAsync(Pod("b"), settings);
+        await Until(() => controller.Snapshot.State == PlaybackState.Streaming && controller.Snapshot.AutoAlignmentDelay is null);
+    }
     private static async Task Until(Func<bool> predicate)
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3)); while (!predicate()) await Task.Delay(5, timeout.Token);

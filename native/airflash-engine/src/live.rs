@@ -1,7 +1,7 @@
 //! Native playback loopback or recording input -> one resampler -> bounded PCM queue.
 use crate::{
     rtp::FRAMES,
-    wasapi::{Mmcss, qpc_ns},
+    wasapi::{Mmcss, find_device, qpc_ns},
 };
 use anyhow::{Context, Result, ensure};
 use rubato::{
@@ -20,13 +20,9 @@ use std::{
 };
 use windows::{
     Win32::{
-        Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
         Foundation::{CloseHandle, WAIT_OBJECT_0},
         Media::Audio::*,
-        System::{
-            Com::{StructuredStorage::*, *},
-            Threading::*,
-        },
+        System::{Com::*, Threading::*},
     },
     core::Interface,
 };
@@ -206,20 +202,6 @@ impl Drop for EventGuard {
         }
     }
 }
-// IDs take precedence over friendly names, including names that resemble an ID.
-fn endpoint_index(name: &str, endpoints: &[(String, Option<String>)]) -> Result<usize> {
-    if let Some(index) = endpoints.iter().position(|(id, _)| id == name) {
-        return Ok(index);
-    }
-    let mut matches = endpoints.iter().enumerate()
-        .filter(|(_, (_, friendly))| friendly.as_deref() == Some(name));
-    let Some((index, _)) = matches.next() else {
-        anyhow::bail!("capture endpoint unavailable: {name}");
-    };
-    ensure!(matches.next().is_none(), "capture endpoint name is ambiguous; select a device ID: {name}");
-    Ok(index)
-}
-
 fn capture_flags(flow: EDataFlow) -> Result<u32> {
     let flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_NOPERSIST;
     if flow == eRender {
@@ -228,36 +210,6 @@ fn capture_flags(flow: EDataFlow) -> Result<u32> {
         ensure!(flow == eCapture, "unsupported capture endpoint direction");
         Ok(flags)
     }
-}
-
-fn find_device(enumerator: &IMMDeviceEnumerator, name: Option<&str>) -> Result<IMMDevice> {
-    let Some(name) = name.filter(|s| !s.is_empty()) else {
-        return Ok(unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }?);
-    };
-    let devices = unsafe { enumerator.EnumAudioEndpoints(eAll, DEVICE_STATE_ACTIVE) }?;
-    let mut endpoints = Vec::new();
-    for i in 0..unsafe { devices.GetCount() }? {
-        let device = unsafe { devices.Item(i) }?;
-        let id = unsafe { device.GetId() }?;
-        let identifier = unsafe { id.to_string() };
-        unsafe { CoTaskMemFree(Some(id.0.cast())) };
-        endpoints.push((identifier?, None));
-    }
-    // Avoid reading unrelated friendly-name properties when the request uses an ID.
-    if let Some(index) = endpoints.iter().position(|(id, _)| id == name) {
-        return Ok(unsafe { devices.Item(index as u32) }?);
-    }
-    for (i, (_, friendly)) in endpoints.iter_mut().enumerate() {
-        let device = unsafe { devices.Item(i as u32) }?;
-        let store = unsafe { device.OpenPropertyStore(STGM_READ) }?;
-        let mut value = unsafe { store.GetValue(&PKEY_Device_FriendlyName) }?;
-        if let Ok(text) = unsafe { PropVariantToStringAlloc(&value) } {
-            *friendly = unsafe { text.to_string() }.ok();
-            unsafe { CoTaskMemFree(Some(text.0.cast())) };
-        }
-        unsafe { PropVariantClear(&mut value) }?;
-    }
-    Ok(unsafe { devices.Item(endpoint_index(name, &endpoints)? as u32) }?)
 }
 
 fn capture(
@@ -442,6 +394,7 @@ fn capture(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wasapi::endpoint_index;
 
     #[test]
     fn capture_direction_selects_loopback_only_for_playback() {

@@ -49,6 +49,7 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     public string PageTitle => Pages[Math.Clamp(SelectedPage, 0, Pages.Length - 1)];
     public string PageDescription => new[] { L.Get("Customize startup and appearance"), L.Get("Balance responsiveness and connection stability"), L.Get("Shape the sound sent to all receivers"), L.Get("Choose the audio source to send to HomePod"), L.Get("Manage receivers, connections and per-device settings"), L.Get("Live statistics for the current session"), L.Get("Choose where AirPlay receivers are discovered"), L.Get("Windows audio, wirelessly to HomePod") }[Math.Clamp(SelectedPage, 0, Pages.Length - 1)];
     public ObservableCollection<AudioEndpoint> Endpoints { get; } = [];
+    public ObservableCollection<AudioEndpoint> PlaybackEndpoints { get; } = [];
     public ObservableCollection<DiscoveryAdapterOption> DiscoveryAdapters { get; } = [];
     private string _networkStatus = "";
     public string NetworkStatus { get => _networkStatus; private set => Set(ref _networkStatus, value); }
@@ -107,6 +108,7 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     private void DraftChanged(object? sender, PropertyChangedEventArgs args)
     {
         if (args.PropertyName == nameof(AppSettings.StreamSampleRate)) Equalizer.RefreshHeadroom();
+        if (args.PropertyName == nameof(AppSettings.LocalPlaybackDelayMs)) LocalPlaybackDelayChanged();
         if (_updating) return;
         RefreshValidation();
         if (args.PropertyName == nameof(AppSettings.DiscoveryInterfaceId)) RefreshAdapters();
@@ -146,7 +148,7 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         _validation = Draft.Validate();
         _hasChanges = !SettingsMerge.Equal(_baseline, Draft);
         if (clearError) Error = _validationErrors > 0 ? L.Get("Correct the highlighted fields before applying.") : _validation ?? "";
-        Notify(nameof(HasChanges)); ApplyCommand.Refresh(); OkCommand.Refresh();
+        Notify(nameof(HasChanges)); Notify(nameof(LocalDelayAdjustable)); ApplyCommand.Refresh(); OkCommand.Refresh();
     }
     public void SetValidationErrors(int count) { _validationErrors = Math.Max(0, count); RefreshValidation(); }
     private bool CanApply() => CanEdit && _validationErrors == 0 && _validation is null && HasChanges;
@@ -204,16 +206,29 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         {
             var options = Draft.Options(receiver.Id);
             _baseline.Options(receiver.Id);
+            // Member-keyed channel entries must exist on both sides or they read as edits.
+            void EnsureMembers(Receiver target)
+            {
+                foreach (var peer in target.Peers) { Draft.Options(peer.Id); _baseline.Options(peer.Id); }
+            }
             var row = Receivers.FirstOrDefault(r => r.Receiver.Id == receiver.Id);
             if (row is null)
             {
                 row = new(receiver, options, current => PairRequested?.Invoke(current), () => RemoveManual(receiver.Id), () => CanEdit, () => App.EngineReady && !App.IsClosing);
+                EnsureMembers(receiver);
+                row.SetMembers(receiver.Peers.Select(p => new ReceiverMemberEditor(p, Draft.Options(p.Id))));
                 Receivers.Insert(index, row);
             }
             else
             {
                 row.SetOptions(options);
-                if (!AppViewModel.ReceiverEqual(row.Receiver, receiver)) { row.Receiver = receiver; row.Refresh(); }
+                if (!AppViewModel.ReceiverEqual(row.Receiver, receiver))
+                {
+                    row.Receiver = receiver;
+                    EnsureMembers(receiver);
+                    row.SetMembers(receiver.Peers.Select(p => new ReceiverMemberEditor(p, Draft.Options(p.Id))));
+                    row.Refresh();
+                }
                 var oldIndex = Receivers.IndexOf(row); if (oldIndex != index) Receivers.Move(oldIndex, index);
                 row.Refresh();
             }
@@ -252,6 +267,7 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         if (_disposed) return;
         var selected = Draft.CaptureEndpoint;
         var items = (App.Endpoints.Items ?? []).ToList();
+        UpdatePlaybackEndpoints(items);
         if (!string.IsNullOrWhiteSpace(selected) && items.All(e => e.Id != selected)) items.Add(new(selected, L.Get("Unavailable · ") + selected));
         if (Endpoints.SequenceEqual(items)) return;
         var updating = _updating; _updating = true;
@@ -273,6 +289,51 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
             Draft.RefreshCaptureEndpoint();
         }
         finally { _updating = updating; }
+    }
+    // Local alignment renders on a playback device, so recording inputs are excluded.
+    private void UpdatePlaybackEndpoints(IReadOnlyList<AudioEndpoint> items)
+    {
+        if (_disposed) return;
+        var playback = items.Where(e => e.Kind == AudioEndpointKind.Playback).ToList();
+        var selected = Draft.LocalPlaybackEndpoint;
+        if (!string.IsNullOrWhiteSpace(selected) && playback.All(e => e.Id != selected))
+            playback.Add(new(selected, L.Get("Unavailable · ") + selected, AudioEndpointKind.Playback));
+        var updating = _updating; _updating = true;
+        try
+        {
+            foreach (var item in PlaybackEndpoints.Where(e => playback.All(i => i.Id != e.Id)).ToArray()) PlaybackEndpoints.Remove(item);
+            for (var i = 0; i < playback.Count; i++)
+            {
+                var old = PlaybackEndpoints.FirstOrDefault(e => e.Id == playback[i].Id);
+                if (old is null) PlaybackEndpoints.Insert(i, playback[i]);
+                else
+                {
+                    var index = PlaybackEndpoints.IndexOf(old);
+                    if (index != i) PlaybackEndpoints.Move(index, i);
+                    if (PlaybackEndpoints[i] != playback[i]) PlaybackEndpoints[i] = playback[i];
+                }
+            }
+        }
+        finally { _updating = updating; }
+    }
+    // The alignment delay is applied to the running session, like the equalizer preview.
+    // Automatic delay detection owns the value, so the manual slider steps aside.
+    public bool LocalDelayAdjustable => Draft.LocalPlaybackEnabled && !Draft.LocalPlaybackAutoDelay;
+    private int _lastDelaySent = -1;
+    private async void LocalPlaybackDelayChanged()
+    {
+        if (_updating || _disposed) return;
+        if (Draft.LocalPlaybackAutoDelay) return;
+        var value = Draft.LocalPlaybackDelay;
+        if (value == _lastDelaySent) return;
+        _lastDelaySent = value;
+        try
+        {
+            await Task.Delay(120).ConfigureAwait(true);
+            if (_disposed || Draft.LocalPlaybackDelay != value) return;
+            await App.Session.SetLocalPlaybackDelayAsync(value).ConfigureAwait(true);
+        }
+        catch (Exception error) { if (!_disposed) AppPaths.Log(error.ToString()); }
     }
     private void NetworkChanged(object? sender, EventArgs args) => Application.Current.Dispatcher.BeginInvoke(RefreshAdapters);
     private void NetworkAvailabilityChanged(object? sender, NetworkAvailabilityEventArgs args) => Application.Current.Dispatcher.BeginInvoke(RefreshAdapters);
@@ -338,5 +399,21 @@ public sealed class ReceiverEditor : ObservableObject
     public bool IsManual => Receiver.IsManual;
     public RelayCommand PairCommand { get; }
     public RelayCommand RemoveCommand { get; }
+    // Every physical device picks its own channel; a stereo pair splits across its members.
+    public ObservableCollection<ReceiverMemberEditor> Members { get; } = [];
+    public void SetMembers(IEnumerable<ReceiverMemberEditor> members)
+    {
+        var rows = members.ToArray();
+        if (Members.SequenceEqual(rows)) return;
+        Members.Clear();
+        foreach (var row in rows) Members.Add(row);
+    }
     public void Refresh() { Notify(nameof(Name)); Notify(nameof(Detail)); Notify(nameof(IsManual)); PairCommand.Refresh(); RemoveCommand.Refresh(); }
+}
+public sealed class ReceiverMemberEditor : ObservableObject
+{
+    public Receiver Member { get; }
+    public ReceiverOptions Options { get; }
+    public ReceiverMemberEditor(Receiver member, ReceiverOptions options) { Member = member; Options = options; }
+    public string Label => ReceiverIdentity.Endpoint(Member.Address, Member.Port);
 }

@@ -14,13 +14,58 @@ use std::{
 };
 use windows::{
     Win32::{
+        Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
         Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0},
         Media::Audio::*,
-        System::{Com::*, Performance::*, Threading::*},
+        System::{Com::{StructuredStorage::*, *}, Performance::*, Threading::*},
     },
     core::w,
 };
 
+// IDs take precedence over friendly names, including names that resemble an ID.
+pub fn endpoint_index(name: &str, endpoints: &[(String, Option<String>)]) -> Result<usize> {
+    if let Some(index) = endpoints.iter().position(|(id, _)| id == name) {
+        return Ok(index);
+    }
+    let mut matches = endpoints.iter().enumerate()
+        .filter(|(_, (_, friendly))| friendly.as_deref() == Some(name));
+    let Some((index, _)) = matches.next() else {
+        anyhow::bail!("audio endpoint unavailable: {name}");
+    };
+    ensure!(matches.next().is_none(), "audio endpoint name is ambiguous; select a device ID: {name}");
+    Ok(index)
+}
+/// Resolve a capture or render endpoint by device ID or friendly name.
+/// An empty or missing name selects the default render endpoint.
+pub fn find_device(enumerator: &IMMDeviceEnumerator, name: Option<&str>) -> Result<IMMDevice> {
+    let Some(name) = name.filter(|s| !s.is_empty()) else {
+        return Ok(unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }?);
+    };
+    let devices = unsafe { enumerator.EnumAudioEndpoints(eAll, DEVICE_STATE_ACTIVE) }?;
+    let mut endpoints = Vec::new();
+    for i in 0..unsafe { devices.GetCount() }? {
+        let device = unsafe { devices.Item(i) }?;
+        let id = unsafe { device.GetId() }?;
+        let identifier = unsafe { id.to_string() };
+        unsafe { CoTaskMemFree(Some(id.0.cast())) };
+        endpoints.push((identifier?, None));
+    }
+    // Avoid reading unrelated friendly-name properties when the request uses an ID.
+    if let Some(index) = endpoints.iter().position(|(id, _)| id == name) {
+        return Ok(unsafe { devices.Item(index as u32) }?);
+    }
+    for (i, (_, friendly)) in endpoints.iter_mut().enumerate() {
+        let device = unsafe { devices.Item(i as u32) }?;
+        let store = unsafe { device.OpenPropertyStore(STGM_READ) }?;
+        let mut value = unsafe { store.GetValue(&PKEY_Device_FriendlyName) }?;
+        if let Ok(text) = unsafe { PropVariantToStringAlloc(&value) } {
+            *friendly = unsafe { text.to_string() }.ok();
+            unsafe { CoTaskMemFree(Some(text.0.cast())) };
+        }
+        unsafe { PropVariantClear(&mut value) }?;
+    }
+    Ok(unsafe { devices.Item(endpoint_index(name, &endpoints)? as u32) }?)
+}
 pub fn qpc_ns() -> u64 {
     let mut count = 0;
     let mut frequency = 0;
